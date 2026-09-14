@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+akshare
+pandas
+pydantic
