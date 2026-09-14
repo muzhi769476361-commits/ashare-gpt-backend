@@ -2,6 +2,8 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import akshare as ak
 import datetime
+import pandas as pd
+from pytdx.hq import TdxHq_API
 
 app = FastAPI(title="Pro WallStreet & 10jqka Intelligence API")
 
@@ -16,16 +18,109 @@ app.add_middleware(
 def read_root():
     return {"status": "ok", "message": "Pro Financial Dual Engine API is fully live!"}
 
-# ==================== 1. 【同花顺 (10jqka) 顶级游资与量化模块】 ====================
+# ==================== 0. 通达信 (pytdx) 逐笔大单实时监控模块 ====================
 
-# A. 同花顺涨停池/连板天梯/炸板率（短线情绪核心）
+@app.get("/api/tdx_large_orders")
+def get_tdx_large_orders(
+    symbol: str = Query(..., description="A股代码，如 600519 或 000001"),
+    min_amount_wan: float = Query(100.0, description="单笔成交金额门槛（单位：万元），默认100万")
+):
+    """
+    基于 pytdx 直连通达信服务器，拉取今日最新逐笔成交明细，并筛选出单笔金额大于指定门槛的主力超大单（用于精准识别吸筹/砸盘）
+    """
+    clean_symbol = "".join(filter(str.isdigit, symbol))
+    market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0  # 1 为沪市, 0 为深市
+    
+    api = TdxHq_API(heartbeat=True)
+    # 通达信主干服务器节点列表
+    hosts = [
+        {"ip": "119.147.212.81", "port": 7709},
+        {"ip": "114.80.63.12", "port": 7709},
+        {"ip": "47.103.48.45", "port": 7709}
+    ]
+    
+    connected = False
+    for host in hosts:
+        if api.connect(host["ip"], host["port"]):
+            connected = True
+            break
+            
+    if not connected:
+        return {"status": "error", "message": "无法连接至通达信行情服务器，请稍后重试"}
+        
+    try:
+        # 获取分时逐笔成交数据（默认调取最近的交易分段）
+        all_transactions = []
+        start_pos = 0
+        while True:
+            data = api.get_transaction_data(market, clean_symbol, start_pos, 2000)
+            if not data or len(data) == 0:
+                break
+            all_transactions.extend(data)
+            if len(data) < 2000:
+                break
+            start_pos += len(data)
+            if start_pos >= 10000: # 最多读取最近 10000 笔逐笔，防止超时
+                break
+                
+        api.disconnect()
+        
+        if not all_transactions:
+            return {"status": "error", "message": "未读取到该股票今日逐笔明细"}
+            
+        df = pd.DataFrame(all_transactions)
+        
+        # 计算每笔成交金额（万元）
+        # pytdx 字段：price (价格), vol (手), buyorsell (0:买入/主动吃单, 1:卖出/主动砸盘, 2:中性盘)
+        df['amount_wan'] = (df['price'] * df['vol'] * 100) / 10000.0
+        
+        # 筛选单笔金额 >= 指定门槛的超大单
+        large_df = df[df['amount_wan'] >= min_amount_wan].copy()
+        
+        if large_df.empty:
+            return {
+                "status": "success",
+                "symbol": clean_symbol,
+                "message": f"今日暂未发现单笔金额大于 {min_amount_wan} 万元的超大单",
+                "data": []
+            }
+            
+        # 转换 buyorsell 标识
+        type_map = {0: "主动买单(吃单/吸筹)", 1: "主动卖单(砸盘/出货)", 2: "中性单"}
+        large_df['order_type'] = large_df['buyorsell'].map(type_map)
+        
+        # 统计主力主动买卖汇总数据
+        buy_sum = large_df[large_df['buyorsell'] == 0]['amount_wan'].sum()
+        sell_sum = large_df[large_df['buyorsell'] == 1]['amount_wan'].sum()
+        net_inflow = buy_sum - sell_sum
+        
+        summary = {
+            "大单定义门槛": f"{min_amount_wan} 万元/笔",
+            "大单成交总笔数": len(large_df),
+            "主力大单主动买入额": f"{round(buy_sum, 2)} 万元",
+            "主力大单主动卖出额": f"{round(sell_sum, 2)} 万元",
+            "主力大单净流入额": f"{round(net_inflow, 2)} 万元"
+        }
+        
+        # 排序输出最新的 30 笔大单明细
+        records = large_df[['time', 'price', 'vol', 'amount_wan', 'order_type']].tail(30).to_dict(orient="records")
+        
+        return {
+            "status": "success",
+            "symbol": clean_symbol,
+            "summary": summary,
+            "recent_large_orders": records
+        }
+    except Exception as e:
+        api.disconnect()
+        return {"status": "error", "message": f"提取逐笔大单失败: {str(e)}"}
+
+# ==================== 1. 同花顺 (10jqka) 顶级游资与量化模块 ====================
+
 @app.get("/api/ths_limit_pool")
 def get_ths_limit_pool(
     action: str = Query("涨停", description="可选: '涨停'(连板池), '炸板'(冲高回落), '跌停'")
 ):
-    """
-    获取同花顺短线情绪池：涨停连板天梯、炸板率、跌停池（游资看盘核心）
-    """
     try:
         date_str = datetime.datetime.now().strftime("%Y%m%d")
         if action == "炸板":
@@ -41,12 +136,8 @@ def get_ths_limit_pool(
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# B. 同花顺问财 (iFind) 自然语言量化选股引擎
 @app.get("/api/ths_wencai")
 def get_ths_wencai(query: str = Query(..., description="同花顺问财条件，如：'连续3天大涨且主力资金净流入前10'")):
-    """
-    调用同花顺底层问财 AI 量化选股引擎，执行自然语言智能选股
-    """
     try:
         df = ak.stock_wencai_query(query=query)
         if df.empty:
@@ -55,7 +146,6 @@ def get_ths_wencai(query: str = Query(..., description="同花顺问财条件，
     except Exception as e:
         return {"status": "error", "message": f"问财接口查询失败: {str(e)}"}
 
-# C. 同花顺实时热搜榜（游资散户焦点）
 @app.get("/api/ths_hot_rank")
 def get_ths_hot_rank(limit: int = Query(20, description="热搜榜前多少名")):
     try:
@@ -66,7 +156,6 @@ def get_ths_hot_rank(limit: int = Query(20, description="热搜榜前多少名")
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# D. 同花顺特色炒作概念板块
 @app.get("/api/ths_board_concept")
 def get_ths_board_concept():
     try:
@@ -77,7 +166,7 @@ def get_ths_board_concept():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# ==================== 2. A股分时走势 (1/5/15分钟级) ====================
+# ==================== 2. A股分时走势与全球行情 ====================
 
 @app.get("/api/stock_zh_a_min")
 def get_stock_zh_a_min(
@@ -98,8 +187,6 @@ def get_stock_zh_a_min(
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
-# ==================== 3. 全球 5 大股市日线 ====================
 
 @app.get("/api/stock_zh_a")
 def get_stock_zh_a(symbol: str = Query(..., description="A股代码")):
@@ -127,24 +214,6 @@ def get_stock_us(symbol: str = Query(..., description="美股代码")):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.get("/api/stock_kr")
-def get_stock_kr(symbol: str = Query(..., description="韩国代码")):
-    try:
-        df = ak.stock_js_global_history(symbol=symbol.upper())
-        return {"status": "success", "market": "韩国股市", "symbol": symbol, "kline_data": df.tail(30).to_dict(orient="records")}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/api/stock_jp")
-def get_stock_jp(symbol: str = Query(..., description="日本代码")):
-    try:
-        df = ak.stock_js_global_history(symbol=symbol.upper())
-        return {"status": "success", "market": "日本股市", "symbol": symbol, "kline_data": df.tail(30).to_dict(orient="records")}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# ==================== 4. 资金流向、龙虎榜与新闻电报 ====================
-
 @app.get("/api/sector_fund_flow")
 def get_sector_fund_flow(sector_type: str = Query("行业资金流", description="'行业资金流' 或 '概念资金流'")):
     try:
@@ -159,26 +228,6 @@ def get_lhb_detail(date: str = Query(None, description="YYYYMMDD")):
         date = date or datetime.datetime.now().strftime("%Y%m%d")
         df = ak.stock_lhb_detail_em(start_date=date, end_date=date)
         return {"status": "success", "date": date, "data": df.head(30).to_dict(orient="records")}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/api/etf_spot")
-def get_etf_spot(symbol: str = Query(None, description="ETF代码")):
-    try:
-        if symbol:
-            clean_symbol = "".join(filter(str.isdigit, symbol))
-            df = ak.fund_etf_hist_em(symbol=clean_symbol, period="daily", adjust="qfq")
-            return {"status": "success", "symbol": clean_symbol, "kline_data": df.tail(30).to_dict(orient="records")}
-        df = ak.fund_etf_spot_em()
-        return {"status": "success", "data": df.head(20).to_dict(orient="records")}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/api/global_indices")
-def get_global_indices():
-    try:
-        df = ak.stock_zh_index_spot_em()
-        return {"status": "success", "data": df.head(30).to_dict(orient="records")}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
