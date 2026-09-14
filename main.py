@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import akshare as ak
+import datetime
 
-app = FastAPI(title="Global Markets & A-Share Advanced Analytics API")
+app = FastAPI(title="Global Financial Intelligence API")
 
 # 允许跨域请求
 app.add_middleware(
@@ -14,7 +15,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Global Markets API with Fund Flow & ETF is running!"}
+    return {"status": "ok", "message": "Global Markets & News API is live!"}
 
 # ==================== 1. 全球 5 大资本市场接口 ====================
 
@@ -70,9 +71,8 @@ def get_stock_jp(symbol: str = Query(..., description="日本股票代码，如 
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# ==================== 2. A股专项进阶数据接口 ====================
+# ==================== 2. A股专项与资金面接口 ====================
 
-# A. 板块/概念资金流向
 @app.get("/api/sector_fund_flow")
 def get_sector_fund_flow(sector_type: str = Query("行业资金流", description="可选类型：'行业资金流' 或 '概念资金流'")):
     try:
@@ -80,21 +80,16 @@ def get_sector_fund_flow(sector_type: str = Query("行业资金流", description
             df = ak.stock_fund_flow_concept(symbol="即时")
         else:
             df = ak.stock_fund_flow_industry(symbol="即时")
-        
         if df.empty:
             return {"status": "error", "message": "未能获取资金流向数据"}
-        # 返回资金净流入前 20 的板块
         return {"status": "success", "type": sector_type, "data": df.head(20).to_dict(orient="records")}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# B. 龙虎榜数据
 @app.get("/api/lhb_detail")
-def get_lhb_detail(date: str = Query(None, description="查询日期，格式 YYYYMMDD，如 20260330，留空则为最新一期")):
+def get_lhb_detail(date: str = Query(None, description="查询日期YYYYMMDD，留空则为最新")):
     try:
-        # 如果未指定日期，获取最新的龙虎榜活跃买卖营业部/机构详情
         if not date:
-            import datetime
             date = datetime.datetime.now().strftime("%Y%m%d")
         df = ak.stock_lhb_detail_em(start_date=date, end_date=date)
         if df.empty:
@@ -103,9 +98,8 @@ def get_lhb_detail(date: str = Query(None, description="查询日期，格式 YY
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# C. 场内 ETF 基金实时行情与日线
 @app.get("/api/etf_spot")
-def get_etf_spot(symbol: str = Query(None, description="场内 ETF 代码，如 510300（沪深300ETF）或 159915（创业板ETF），留空返回全市场前20")):
+def get_etf_spot(symbol: str = Query(None, description="场内 ETF 代码，如 510300 或 159915")):
     try:
         if symbol:
             clean_symbol = "".join(filter(str.isdigit, symbol))
@@ -114,8 +108,32 @@ def get_etf_spot(symbol: str = Query(None, description="场内 ETF 代码，如 
                 return {"status": "error", "message": "未找到该 ETF 数据"}
             return {"status": "success", "type": "单只ETF日线", "symbol": clean_symbol, "kline_data": df.tail(30).to_dict(orient="records")}
         else:
-            # 返回全市场实时场内 ETF 榜单
             df = ak.fund_etf_spot_em()
             return {"status": "success", "type": "全市场ETF行情", "data": df.head(20).to_dict(orient="records")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ==================== 3. 补充能力：宏观大盘指数 & 7x24快讯 ====================
+
+# A. 全球核心指数行情
+@app.get("/api/global_indices")
+def get_global_indices():
+    try:
+        df = ak.stock_zh_index_spot_em()
+        if df.empty:
+            return {"status": "error", "message": "未能获取指数数据"}
+        # 返回主要大盘指数（如上证指数、深证成指、创业板指、科创50等）
+        return {"status": "success", "data": df.head(30).to_dict(orient="records")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# B. 财联社 7x24 小时实时财经新闻电报
+@app.get("/api/cls_telegraph")
+def get_cls_telegraph(limit: int = Query(20, description="获取最新的电报条数")):
+    try:
+        df = ak.stock_telegraph_cls()
+        if df.empty:
+            return {"status": "error", "message": "未获取到电报数据"}
+        return {"status": "success", "news_count": limit, "news": df.head(limit).to_dict(orient="records")}
     except Exception as e:
         return {"status": "error", "message": str(e)}
