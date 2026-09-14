@@ -166,3 +166,17 @@ def get_cls_telegraph(limit: int = Query(20, description="获取电报条数")):
         return {"status": "success", "news_count": limit, "news": df.head(limit).to_dict(orient="records")}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+        # ==================== 4. 补充能力：新浪财经实时新闻 ====================
+
+@app.get("/api/sina_news")
+def get_sina_news(limit: int = Query(20, description="获取最新的新浪财经新闻条数")):
+    """
+    获取新浪财经 7x24 小时全网实时新闻与深度解读
+    """
+    try:
+        df = ak.stock_news_em(symbol="100")  # 抓取全网高权重实时财经新闻
+        if df.empty:
+            df = ak.js_news(timestamp=int(datetime.datetime.now().timestamp()))
+        return {"status": "success", "news_count": limit, "news": df.head(limit).to_dict(orient="records")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
