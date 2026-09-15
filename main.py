@@ -2,7 +2,12 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import akshare as ak
 import datetime
+import json
 import pandas as pd
+import requests
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pytdx.hq import TdxHq_API
 
 app = FastAPI(title="Pro WallStreet & 10jqka Intelligence API")
@@ -14,9 +19,357 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+MARKET_SNAPSHOT_TTL_SECONDS = 30
+_market_snapshot_cache = {"expires_at": 0.0, "value": None}
+_market_snapshot_lock = threading.Lock()
+
+
+def _china_now():
+    return datetime.datetime.now(CHINA_TZ)
+
+
+def _json_records(df, limit=None):
+    """把 DataFrame 转成 FastAPI 可稳定序列化的 JSON 记录。"""
+    if df is None or df.empty:
+        return []
+    if limit is not None:
+        df = df.head(limit)
+    return json.loads(df.to_json(orient="records", force_ascii=False, date_format="iso"))
+
+
+def _first_column(df, *names):
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _number(value, digits=2):
+    try:
+        if pd.isna(value):
+            return None
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_session(now):
+    """按中国大陆常规交易时段估算；法定休市日由上游是否有数据进一步确认。"""
+    if now.weekday() >= 5:
+        return "closed_weekend", False
+    current = now.time()
+    if current < datetime.time(9, 15):
+        return "pre_market", False
+    if current < datetime.time(9, 30):
+        return "call_auction", False
+    if current <= datetime.time(11, 30):
+        return "morning_session", True
+    if current < datetime.time(13, 0):
+        return "lunch_break", False
+    if current <= datetime.time(15, 0):
+        return "afternoon_session", True
+    return "after_hours", False
+
+
+def _fetch_major_indices_tdx():
+    targets = [
+        (1, "000001", "上证指数"),
+        (0, "399001", "深证成指"),
+        (0, "399006", "创业板指"),
+        (1, "000688", "科创50"),
+    ]
+    api = TdxHq_API(heartbeat=True)
+    hosts = [
+        ("119.147.212.81", 7709),
+        ("114.80.63.12", 7709),
+        ("47.103.48.45", 7709),
+    ]
+    connected = False
+    try:
+        for ip, port in hosts:
+            if api.connect(ip, port):
+                connected = True
+                break
+        if not connected:
+            raise ConnectionError("通达信指数备用源连接失败")
+        quotes = api.get_security_quotes([(market, code) for market, code, _ in targets]) or []
+        quote_by_code = {str(item.get("code")): item for item in quotes}
+        result = []
+        for _, code, name in targets:
+            item = quote_by_code.get(code)
+            if not item:
+                continue
+            last = _number(item.get("price"))
+            previous = _number(item.get("last_close"))
+            change_pct = _number((last - previous) / previous * 100) if last is not None and previous else None
+            result.append({
+                "code": code,
+                "name": name,
+                "source": "通达信",
+                "last": last,
+                "change_pct": change_pct,
+                "turnover_yi": _number(_number(item.get("amount"), 4) / 100000000)
+                if _number(item.get("amount"), 4) is not None else None,
+            })
+        if not result:
+            raise ValueError("通达信指数备用源未返回行情")
+        return result
+    finally:
+        if connected:
+            api.disconnect()
+
+
+def _fetch_major_indices_tencent():
+    symbols = "s_sh000001,s_sz399001,s_sz399006,s_sh000688"
+    response = requests.get(
+        f"https://qt.gtimg.cn/q={symbols}",
+        headers={"Referer": "https://finance.qq.com/"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    text = response.content.decode("gbk", errors="replace")
+    result = []
+    for line in text.splitlines():
+        if '="' not in line:
+            continue
+        fields = line.split('="', 1)[1].rstrip('";').split("~")
+        if len(fields) < 10:
+            continue
+        result.append({
+            "code": fields[2],
+            "name": fields[1],
+            "source": "腾讯",
+            "last": _number(fields[3]),
+            "change_pct": _number(fields[5]),
+            # 腾讯简版指数行情的成交额字段单位为百万元。
+            "turnover_yi": _number(float(fields[9]) / 100) if fields[9] else None,
+        })
+    if not result:
+        raise ValueError("腾讯指数备用源未返回行情")
+    return result
+
+
+def _fetch_major_indices():
+    try:
+        df = ak.stock_zh_index_spot_em()
+        source = "东方财富"
+    except Exception:
+        try:
+            df = ak.stock_zh_index_spot_sina()
+            source = "新浪"
+        except Exception:
+            try:
+                return _fetch_major_indices_tencent()
+            except Exception:
+                return _fetch_major_indices_tdx()
+    code_col = _first_column(df, "代码", "指数代码", "code")
+    name_col = _first_column(df, "名称", "指数名称", "name")
+    price_col = _first_column(df, "最新价", "最新", "zxj")
+    pct_col = _first_column(df, "涨跌幅")
+    amount_col = _first_column(df, "成交额", "turnover")
+    if not code_col:
+        raise ValueError("指数行情缺少代码字段")
+
+    targets = {
+        "000001": "上证指数",
+        "399001": "深证成指",
+        "399006": "创业板指",
+        "000688": "科创50",
+    }
+    result = []
+    codes = df[code_col].astype(str).str.extract(r"(\d{6})", expand=False)
+    for code, fallback_name in targets.items():
+        rows = df[codes == code]
+        if rows.empty:
+            continue
+        row = rows.iloc[0]
+        raw_amount = _number(row[amount_col]) if amount_col else None
+        result.append({
+            "code": code,
+            "name": str(row[name_col]) if name_col else fallback_name,
+            "source": source,
+            "last": _number(row[price_col]) if price_col else None,
+            "change_pct": _number(row[pct_col]) if pct_col else None,
+            "turnover_yi": _number(raw_amount / 100000000) if raw_amount is not None else None,
+        })
+    return result
+
+
+def _fetch_market_breadth():
+    try:
+        df = ak.stock_zh_a_spot_em()
+        source = "东方财富"
+    except Exception:
+        df = ak.stock_zh_a_spot_tx()
+        source = "腾讯"
+    pct_col = _first_column(df, "涨跌幅", "zdf")
+    amount_col = _first_column(df, "成交额", "turnover")
+    code_col = _first_column(df, "代码", "code")
+    name_col = _first_column(df, "名称", "name")
+    price_col = _first_column(df, "最新价", "zxj")
+    if not pct_col:
+        raise ValueError("A股实时行情缺少涨跌幅字段")
+
+    pct = pd.to_numeric(df[pct_col], errors="coerce").dropna()
+    total = int(len(pct))
+    advancers = int((pct > 0).sum())
+    decliners = int((pct < 0).sum())
+    unchanged = int((pct == 0).sum())
+    turnover = pd.to_numeric(df[amount_col], errors="coerce").sum() if amount_col else None
+    turnover_divisor = 10000 if source == "腾讯" else 100000000
+
+    ranked = df.assign(_pct=pd.to_numeric(df[pct_col], errors="coerce"))
+    gainers = ranked.sort_values("_pct", ascending=False)
+    losers = ranked.sort_values("_pct", ascending=True)
+
+    def ranked_records(frame):
+        records = []
+        for _, row in frame.head(8).iterrows():
+            raw_turnover = _number(row[amount_col]) if amount_col else None
+            records.append({
+                "code": str(row[code_col]) if code_col else None,
+                "name": str(row[name_col]) if name_col else None,
+                "last": _number(row[price_col]) if price_col else None,
+                "change_pct": _number(row[pct_col]),
+                "turnover_yi": _number(raw_turnover / turnover_divisor) if raw_turnover is not None else None,
+            })
+        return records
+
+    return {
+        "source": source,
+        "listed_with_quotes": total,
+        "advancers": advancers,
+        "decliners": decliners,
+        "unchanged": unchanged,
+        "advance_ratio": round(advancers / total, 4) if total else None,
+        "median_change_pct": _number(pct.median()),
+        "turnover_yi": _number(turnover / turnover_divisor) if turnover is not None else None,
+        "top_gainers": ranked_records(gainers),
+        "top_losers": ranked_records(losers),
+    }
+
+
+def _fetch_limit_activity(now):
+    date_str = now.strftime("%Y%m%d")
+    limit_up = ak.stock_zt_pool_em(date=date_str)
+    broken = ak.stock_zt_pool_zbgc_em(date=date_str)
+    return {
+        "date": date_str,
+        "limit_up_count": int(len(limit_up.index)),
+        "broken_limit_count": int(len(broken.index)),
+        "limit_up_leaders": _json_records(limit_up, 12),
+        "broken_limit_examples": _json_records(broken, 8),
+    }
+
+
+def _fetch_sector_flows():
+    df = ak.stock_fund_flow_industry(symbol="即时")
+    net_col = _first_column(df, "净额", "净流入", "今日主力净流入-净额")
+    if net_col:
+        df = df.assign(_net=pd.to_numeric(df[net_col], errors="coerce")).sort_values("_net", ascending=False)
+        df = df.drop(columns=["_net"])
+    return _json_records(df, 10)
+
+
+def _market_analysis(breadth, limit_activity):
+    ratio = breadth.get("advance_ratio") if breadth else None
+    median = breadth.get("median_change_pct") if breadth else None
+    if ratio is None or median is None:
+        tone = "数据不足"
+    elif ratio >= 0.60 and median >= 0.50:
+        tone = "偏强"
+    elif ratio <= 0.40 and median <= -0.50:
+        tone = "偏弱"
+    else:
+        tone = "震荡分化"
+
+    limit_count = (limit_activity or {}).get("limit_up_count")
+    broken_count = (limit_activity or {}).get("broken_limit_count")
+    if limit_count is None or broken_count is None:
+        short_term = "数据不足"
+    elif limit_count >= 60 and broken_count <= max(10, limit_count * 0.25):
+        short_term = "短线情绪活跃"
+    elif broken_count > max(15, limit_count * 0.5):
+        short_term = "炸板率较高，追涨风险上升"
+    else:
+        short_term = "短线情绪中性"
+    return {"breadth_tone": tone, "short_term_sentiment": short_term}
+
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Pro Financial Dual Engine API is fully live!"}
+    return {
+        "status": "ok",
+        "message": "Pro Financial Dual Engine API is fully live!",
+        "recommended_endpoint": "/api/market_snapshot",
+        "docs": "/docs",
+    }
+
+
+@app.get("/api/market_snapshot")
+def get_market_snapshot(
+    refresh: bool = Query(False, description="忽略30秒缓存并重新抓取；通常保持 false")
+):
+    """
+    一次返回 A 股主要指数、市场广度、成交额、涨停/炸板和行业资金流。
+
+    这是面向分析的近实时快照，并非交易所逐笔行情；每个数据源独立容错，部分
+    上游失败时仍返回其他成功字段，同时在 errors 中说明原因。
+    """
+    now = _china_now()
+    monotonic_now = time.monotonic()
+    if not refresh:
+        cached = _market_snapshot_cache.get("value")
+        if cached is not None and monotonic_now < _market_snapshot_cache.get("expires_at", 0):
+            result = dict(cached)
+            result["cache"] = "hit"
+            return result
+
+    with _market_snapshot_lock:
+        monotonic_now = time.monotonic()
+        if not refresh:
+            cached = _market_snapshot_cache.get("value")
+            if cached is not None and monotonic_now < _market_snapshot_cache.get("expires_at", 0):
+                result = dict(cached)
+                result["cache"] = "hit"
+                return result
+
+        started = time.monotonic()
+        jobs = {
+            "indices": _fetch_major_indices,
+            "breadth": _fetch_market_breadth,
+            "limit_activity": lambda: _fetch_limit_activity(now),
+            "sector_fund_flow": _fetch_sector_flows,
+        }
+        data = {}
+        errors = {}
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = {executor.submit(func): name for name, func in jobs.items()}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    data[name] = future.result()
+                except Exception as exc:
+                    errors[name] = str(exc)[:300]
+
+        session, is_trading = _market_session(now)
+        result = {
+            "status": "success" if not errors else ("partial" if data else "error"),
+            "as_of": now.isoformat(timespec="seconds"),
+            "timezone": "Asia/Shanghai",
+            "market": "China A-shares",
+            "session_estimate": session,
+            "is_regular_trading_time": is_trading,
+            "freshness": "near-real-time; upstream sources may be delayed",
+            "cache": "miss",
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            **data,
+            "analysis": _market_analysis(data.get("breadth"), data.get("limit_activity")),
+            "errors": errors,
+        }
+        _market_snapshot_cache["value"] = result
+        _market_snapshot_cache["expires_at"] = time.monotonic() + MARKET_SNAPSHOT_TTL_SECONDS
+        return result
 
 # ==================== 0. 通达信 (pytdx) 逐笔大单实时监控模块 ====================
 
@@ -124,9 +477,9 @@ def get_ths_limit_pool(
     try:
         date_str = datetime.datetime.now().strftime("%Y%m%d")
         if action == "炸板":
-            df = ak.stock_zt_pool_zbp_em(date=date_str)
+            df = ak.stock_zt_pool_zbgc_em(date=date_str)
         elif action == "跌停":
-            df = ak.stock_dt_pool_em(date=date_str)
+            df = ak.stock_zt_pool_dtgc_em(date=date_str)
         else:
             df = ak.stock_zt_pool_em(date=date_str)
             
