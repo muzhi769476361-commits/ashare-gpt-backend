@@ -1,17 +1,22 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 import akshare as ak
 import datetime
 import json
 import os
 import pandas as pd
+import psycopg
 import requests
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pytdx.hq import TdxHq_API
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://my-akshare-api.onrender.com").rstrip("/")
+FEISHU_CHAT_ID = os.getenv("FEISHU_CHAT_ID", "oc_b0e4dce21c9ca3f03c33d30d407db76f")
+INTEL_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 app = FastAPI(
     title="Pro WallStreet & 10jqka Intelligence API",
@@ -302,6 +307,186 @@ def _market_analysis(breadth, limit_activity):
     else:
         short_term = "短线情绪中性"
     return {"breadth_tone": tone, "short_term_sentiment": short_term}
+
+
+def _message_text(content):
+    parts = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str):
+                parts.append(value["text"])
+            for key, item in value.items():
+                if key != "text":
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, str):
+            parts.append(value)
+
+    walk(content)
+    return "\n".join(part.strip() for part in parts if part and part.strip())
+
+
+def _require_intel_api_key(provided_key):
+    expected_key = os.getenv("INTEL_API_KEY", "")
+    if not expected_key:
+        raise HTTPException(status_code=503, detail="INTEL_API_KEY is not configured")
+    if not provided_key or not secrets.compare_digest(provided_key, expected_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _database_url():
+    value = os.getenv("DATABASE_URL", "")
+    if not value:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
+    return value
+
+
+def _ensure_intel_table(connection):
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS feishu_intel_messages (
+            message_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            create_time BIGINT NOT NULL,
+            msg_type TEXT,
+            text_content TEXT,
+            raw_content JSONB NOT NULL,
+            received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_feishu_intel_chat_time
+        ON feishu_intel_messages (chat_id, create_time DESC)
+        """
+    )
+
+
+def _verify_feishu_token(payload):
+    expected = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="FEISHU_VERIFICATION_TOKEN is not configured")
+    header = payload.get("header") or {}
+    provided = payload.get("token") or header.get("token")
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid Feishu verification token")
+
+
+@app.post("/api/feishu/events", include_in_schema=False)
+def receive_feishu_event(payload: dict):
+    """接收飞书 im.message.receive_v1 事件并幂等写入 PostgreSQL。"""
+    if "encrypt" in payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Encrypted callbacks are not enabled; leave Encrypt Key empty in Feishu",
+        )
+    _verify_feishu_token(payload)
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge")}
+
+    header = payload.get("header") or {}
+    if header.get("event_type") != "im.message.receive_v1":
+        return {"code": 0, "message": "ignored event type"}
+
+    event = payload.get("event") or {}
+    message = event.get("message") or {}
+    chat_id = message.get("chat_id")
+    if chat_id != FEISHU_CHAT_ID:
+        return {"code": 0, "message": "ignored chat"}
+
+    message_id = message.get("message_id")
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id is missing")
+    try:
+        create_time = int(message.get("create_time") or 0)
+    except (TypeError, ValueError):
+        create_time = 0
+    content_raw = message.get("content") or "{}"
+    try:
+        content = json.loads(content_raw) if isinstance(content_raw, str) else content_raw
+    except ValueError:
+        content = {"text": str(content_raw)}
+
+    try:
+        with psycopg.connect(_database_url()) as connection:
+            _ensure_intel_table(connection)
+            connection.execute(
+                """
+                INSERT INTO feishu_intel_messages
+                    (message_id, chat_id, create_time, msg_type, text_content, raw_content)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (message_id) DO UPDATE SET
+                    create_time = EXCLUDED.create_time,
+                    msg_type = EXCLUDED.msg_type,
+                    text_content = EXCLUDED.text_content,
+                    raw_content = EXCLUDED.raw_content
+                """,
+                (
+                    message_id,
+                    chat_id,
+                    create_time,
+                    message.get("message_type"),
+                    _message_text(content),
+                    json.dumps(content, ensure_ascii=False),
+                ),
+            )
+    except psycopg.Error as exc:
+        raise HTTPException(status_code=503, detail=f"Database write failed: {str(exc)[:160]}")
+    return {"code": 0}
+
+
+@app.get(
+    "/api/latest_unicorn_intel",
+    operation_id="get_latest_unicorn_intel",
+    summary="读取A独角兽综合群的最新实时消息",
+)
+def get_latest_unicorn_intel(
+    limit: int = Query(30, ge=1, le=100, description="返回最新消息条数"),
+    since_minutes: int = Query(1440, ge=1, le=10080, description="只返回最近多少分钟，默认24小时"),
+    api_key: str = Security(INTEL_API_KEY_HEADER),
+):
+    _require_intel_api_key(api_key)
+    cutoff_ms = int((_china_now().timestamp() - since_minutes * 60) * 1000)
+    try:
+        with psycopg.connect(_database_url()) as connection:
+            _ensure_intel_table(connection)
+            rows = connection.execute(
+                """
+                SELECT message_id, create_time, msg_type, text_content, raw_content, received_at
+                FROM feishu_intel_messages
+                WHERE chat_id = %s AND create_time >= %s
+                ORDER BY create_time DESC
+                LIMIT %s
+                """,
+                (FEISHU_CHAT_ID, cutoff_ms, limit),
+            ).fetchall()
+    except psycopg.Error as exc:
+        raise HTTPException(status_code=503, detail=f"Database read failed: {str(exc)[:160]}")
+
+    messages = []
+    for message_id, create_time, msg_type, text_content, raw_content, received_at in rows:
+        messages.append({
+            "message_id": message_id,
+            "create_time": str(create_time),
+            "msg_type": msg_type,
+            "text": text_content or "",
+            "content": raw_content,
+            "received_at": received_at.isoformat() if received_at else None,
+        })
+    return {
+        "status": "ready" if messages else "empty",
+        "source": "A独角兽综合群",
+        "as_of": _china_now().isoformat(timespec="seconds"),
+        "window_minutes": since_minutes,
+        "message_count": len(messages),
+        "order": "newest_first",
+        "messages": messages,
+    }
+
 
 @app.get("/")
 def read_root():

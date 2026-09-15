@@ -44,6 +44,34 @@ Render 完成部署后重新导入一次，即可让 GPT 识别 `get_market_snap
 当用户询问当前大盘、实时市场状态、市场情绪、涨跌家数、成交额、涨停炸板或行业资金流时，先调用 GET /api/market_snapshot。必须注明 as_of、数据源和 errors；若 status 为 partial，不得把缺失字段当成零。
 ```
 
+## 飞书群消息实时同步
+
+实时链路不再依赖 GitHub 定时快照：
+
+```text
+飞书 im.message.receive_v1 → POST /api/feishu/events → PostgreSQL
+我的 GPT → GET /api/latest_unicorn_intel → PostgreSQL
+```
+
+Render 环境变量：
+
+- `DATABASE_URL`：PostgreSQL 内部连接地址；
+- `FEISHU_VERIFICATION_TOKEN`：飞书事件订阅页面的 Verification Token；
+- `FEISHU_CHAT_ID`：目标群 ID，默认已配置为 A独角兽综合群；
+- `INTEL_API_KEY`：自定义强随机密钥，GPT Action 使用同一个值作为 `X-API-Key`。
+
+飞书事件订阅的请求地址：
+
+```text
+https://my-akshare-api.onrender.com/api/feishu/events
+```
+
+订阅事件：`im.message.receive_v1`。初次配置请不要填写 Encrypt Key；应用机器人必须加入目标群，并获得读取该群消息所需权限。
+
+GPT 操作身份验证选择 API Key，自定义请求头名称填写 `X-API-Key`。读取接口默认返回最近24小时的30条消息，最多可请求100条、7天。
+
+要保证24小时即时接收，Web Service 必须使用不会休眠的常驻实例；免费休眠实例只能做到被事件唤醒后的尽力接收。
+
 ## 本地运行
 
 ```bash
