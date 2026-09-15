@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import akshare as ak
 import datetime
 import json
+import os
 import pandas as pd
 import requests
 import threading
@@ -10,7 +11,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pytdx.hq import TdxHq_API
 
-app = FastAPI(title="Pro WallStreet & 10jqka Intelligence API")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://my-akshare-api.onrender.com").rstrip("/")
+
+app = FastAPI(
+    title="Pro WallStreet & 10jqka Intelligence API",
+    version="1.1.0",
+    servers=[{"url": PUBLIC_BASE_URL, "description": "Production API"}],
+)
 
 app.add_middleware(
     CORSMiddleware,
