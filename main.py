@@ -898,3 +898,6 @@ def get_stock_l2_ticks(
     except Exception as e:
         api.disconnect()
         return {"status": "error", "message": str(e)}
+        @app.api_route("/health", methods=["GET", "HEAD"])
+def health_check():
+    return {"status": "ok"}
