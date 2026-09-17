@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-akshare
+akshare>=1.12.0
 pandas
 pydantic
 requests
