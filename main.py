@@ -154,7 +154,6 @@ def _fetch_major_indices_tencent():
             "source": "腾讯",
             "last": _number(fields[3]),
             "change_pct": _number(fields[5]),
-            # 腾讯简版指数行情的成交额字段单位为百万元。
             "turnover_yi": _number(float(fields[9]) / 100) if fields[9] else None,
         })
     if not result:
@@ -504,7 +503,6 @@ def get_market_snapshot(
 ):
     """
     一次返回 A 股主要指数、市场广度、成交额、涨停/炸板和行业资金流。
-
     这是面向分析的近实时快照，并非交易所逐笔行情；每个数据源独立容错，部分
     上游失败时仍返回其他成功字段，同时在 errors 中说明原因。
     """
@@ -895,9 +893,10 @@ def get_stock_l2_ticks(
             "count": len(records),
             "ticks": records
         }
-except Exception as e:
+    except Exception as e:
         api.disconnect()
         return {"status": "error", "message": str(e)}
-@app.api_route("health",methods=["GET","head"])
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
-    return{"status":"ok"}
+    return {"status": "ok"}
