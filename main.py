@@ -577,7 +577,6 @@ def get_tdx_large_orders(
     market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0  # 1 为沪市, 0 为深市
     
     api = TdxHq_API(heartbeat=True)
-    # 通达信主干服务器节点列表
     hosts = [
         {"ip": "119.147.212.81", "port": 7709},
         {"ip": "114.80.63.12", "port": 7709},
@@ -594,7 +593,6 @@ def get_tdx_large_orders(
         return {"status": "error", "message": "无法连接至通达信行情服务器，请稍后重试"}
         
     try:
-        # 获取分时逐笔成交数据（默认调取最近的交易分段）
         all_transactions = []
         start_pos = 0
         while True:
@@ -605,7 +603,7 @@ def get_tdx_large_orders(
             if len(data) < 2000:
                 break
             start_pos += len(data)
-            if start_pos >= 10000: # 最多读取最近 10000 笔逐笔，防止超时
+            if start_pos >= 10000:
                 break
                 
         api.disconnect()
@@ -614,12 +612,7 @@ def get_tdx_large_orders(
             return {"status": "error", "message": "未读取到该股票今日逐笔明细"}
             
         df = pd.DataFrame(all_transactions)
-        
-        # 计算每笔成交金额（万元）
-        # pytdx 字段：price (价格), vol (手), buyorsell (0:买入/主动吃单, 1:卖出/主动砸盘, 2:中性盘)
         df['amount_wan'] = (df['price'] * df['vol'] * 100) / 10000.0
-        
-        # 筛选单笔金额 >= 指定门槛的超大单
         large_df = df[df['amount_wan'] >= min_amount_wan].copy()
         
         if large_df.empty:
@@ -630,11 +623,9 @@ def get_tdx_large_orders(
                 "data": []
             }
             
-        # 转换 buyorsell 标识
         type_map = {0: "主动买单(吃单/吸筹)", 1: "主动卖单(砸盘/出货)", 2: "中性单"}
         large_df['order_type'] = large_df['buyorsell'].map(type_map)
         
-        # 统计主力主动买卖汇总数据
         buy_sum = large_df[large_df['buyorsell'] == 0]['amount_wan'].sum()
         sell_sum = large_df[large_df['buyorsell'] == 1]['amount_wan'].sum()
         net_inflow = buy_sum - sell_sum
@@ -647,7 +638,6 @@ def get_tdx_large_orders(
             "主力大单净流入额": f"{round(net_inflow, 2)} 万元"
         }
         
-        # 排序输出最新的 30 笔大单明细
         records = large_df[['time', 'price', 'vol', 'amount_wan', 'order_type']].tail(30).to_dict(orient="records")
         
         return {
@@ -792,4 +782,119 @@ def get_sina_news(limit: int = Query(20)):
             df = ak.js_news(timestamp=int(datetime.datetime.now().timestamp()))
         return {"status": "success", "news": df.head(limit).to_dict(orient="records")}
     except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ==================== 3. Level 2 (L2) 盘口与逐笔极速查询模块 ====================
+
+@app.get("/api/stock_l2_orderbook")
+def get_stock_l2_orderbook(symbol: str = Query(..., description="A股代码，如 600519 或 000001")):
+    """
+    通过 pytdx 直连行情服务器，获取实时 L2 买卖五档盘口（报价与挂单量）及最新价格。
+    """
+    clean_symbol = "".join(filter(str.isdigit, symbol))
+    market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0
+    
+    api = TdxHq_API(heartbeat=True)
+    hosts = [
+        {"ip": "119.147.212.81", "port": 7709},
+        {"ip": "114.80.63.12", "port": 7709},
+        {"ip": "47.103.48.45", "port": 7709}
+    ]
+    
+    connected = False
+    for host in hosts:
+        if api.connect(host["ip"], host["port"]):
+            connected = True
+            break
+            
+    if not connected:
+        return {"status": "error", "message": "无法连接至行情服务器"}
+        
+    try:
+        quotes = api.get_security_quotes([(market, clean_symbol)])
+        api.disconnect()
+        
+        if not quotes:
+            return {"status": "error", "message": "未能获取盘口数据"}
+            
+        q = quotes[0]
+        bid_ask = {
+            "buy_5": {"price": q.get("b5_price"), "vol": q.get("b5_vol")},
+            "buy_4": {"price": q.get("b4_price"), "vol": q.get("b4_vol")},
+            "buy_3": {"price": q.get("b3_price"), "vol": q.get("b3_vol")},
+            "buy_2": {"price": q.get("b2_price"), "vol": q.get("b2_vol")},
+            "buy_1": {"price": q.get("b1_price"), "vol": q.get("b1_vol")},
+            "sell_1": {"price": q.get("a1_price"), "vol": q.get("a1_vol")},
+            "sell_2": {"price": q.get("a2_price"), "vol": q.get("a2_vol")},
+            "sell_3": {"price": q.get("a3_price"), "vol": q.get("a3_vol")},
+            "sell_4": {"price": q.get("a4_price"), "vol": q.get("a4_vol")},
+            "sell_5": {"price": q.get("a5_price"), "vol": q.get("a5_vol")},
+        }
+        
+        return {
+            "status": "success",
+            "symbol": clean_symbol,
+            "last_price": q.get("price"),
+            "open": q.get("open"),
+            "high": q.get("high"),
+            "low": q.get("low"),
+            "last_close": q.get("last_close"),
+            "total_vol": q.get("vol"),
+            "amount": q.get("amount"),
+            "orderbook": bid_ask
+        }
+    except Exception as e:
+        api.disconnect()
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/stock_l2_ticks")
+def get_stock_l2_ticks(
+    symbol: str = Query(..., description="A股代码，如 600519 或 000001"),
+    limit: int = Query(50, ge=1, le=500, description="返回最新逐笔条数")
+):
+    """
+    获取实时分时逐笔成交明细（包含精准时间、成交价、成交量手及买卖方向属性）。
+    """
+    clean_symbol = "".join(filter(str.isdigit, symbol))
+    market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0
+    
+    api = TdxHq_API(heartbeat=True)
+    hosts = [
+        {"ip": "119.147.212.81", "port": 7709},
+        {"ip": "114.80.63.12", "port": 7709},
+        {"ip": "47.103.48.45", "port": 7709}
+    ]
+    
+    connected = False
+    for host in hosts:
+        if api.connect(host["ip"], host["port"]):
+            connected = True
+            break
+            
+    if not connected:
+        return {"status": "error", "message": "无法连接至行情服务器"}
+        
+    try:
+        data = api.get_transaction_data(market, clean_symbol, 0, limit)
+        api.disconnect()
+        
+        if not data:
+            return {"status": "error", "message": "暂无逐笔明细数据"}
+            
+        df = pd.DataFrame(data)
+        type_map = {0: "主动买单", 1: "主动卖单", 2: "中性单"}
+        df['type'] = df['buyorsell'].map(type_map)
+        df['amount_wan'] = (df['price'] * df['vol'] * 100) / 10000.0
+        df['amount_wan'] = df['amount_wan'].round(2)
+        
+        records = df[['time', 'price', 'vol', 'amount_wan', 'type']].to_dict(orient="records")
+        return {
+            "status": "success",
+            "symbol": clean_symbol,
+            "count": len(records),
+            "ticks": records
+        }
+    except Exception as e:
+        api.disconnect()
         return {"status": "error", "message": str(e)}
