@@ -571,7 +571,7 @@ def _clean_a_symbol(symbol):
     return clean_symbol
 
 
-def _eastmoney_intraday(symbol):
+def _eastmoney_trade_prints(symbol):
     """HTTP 方式读取东方财富当日成交明细，避免 Render 无法访问 7709 端口。"""
     market_code = 1 if symbol.startswith(("6", "9")) else 0
     response = requests.get(
@@ -615,7 +615,46 @@ def _eastmoney_intraday(symbol):
         "side": df["side_code"].map(side_map).fillna("未知"),
     }).dropna(subset=["price", "vol"])
     result["amount_wan"] = (result["price"] * result["vol"] * 100 / 10000).round(2)
+    result.attrs["data_level"] = "public_trade_prints_inferred_side"
+    result.attrs["source"] = "东方财富公开成交明细"
+    result.attrs["degraded"] = False
     return result
+
+
+def _eastmoney_intraday(symbol):
+    """逐笔优先；上游断开时降级为一分钟成交额方向代理。"""
+    try:
+        return _eastmoney_trade_prints(symbol)
+    except Exception as trade_error:
+        now = _china_now()
+        start = now.strftime("%Y-%m-%d 09:15:00")
+        end = now.strftime("%Y-%m-%d %H:%M:%S")
+        minute_df = ak.stock_zh_a_hist_min_em(
+            symbol=symbol,
+            start_date=start,
+            end_date=end,
+            period="1",
+            adjust="",
+        )
+        if minute_df is None or minute_df.empty:
+            raise ValueError(f"逐笔与分钟数据均不可用；逐笔错误: {str(trade_error)[:120]}")
+        close = pd.to_numeric(minute_df["收盘"], errors="coerce")
+        volume = pd.to_numeric(minute_df["成交量"], errors="coerce")
+        amount = pd.to_numeric(minute_df["成交额"], errors="coerce")
+        delta = close.diff().fillna(close - pd.to_numeric(minute_df["开盘"], errors="coerce"))
+        side = delta.map(lambda value: "买盘代理" if value > 0 else ("卖盘代理" if value < 0 else "中性代理"))
+        result = pd.DataFrame({
+            "time": minute_df["时间"].astype(str),
+            "price": close,
+            "vol": volume,
+            "side": side,
+            "amount_wan": (amount / 10000).round(2),
+        }).dropna(subset=["price", "vol", "amount_wan"])
+        result.attrs["data_level"] = "one_minute_bar_direction_proxy"
+        result.attrs["source"] = "东方财富一分钟成交额"
+        result.attrs["degraded"] = True
+        result.attrs["degraded_reason"] = f"逐笔上游不可用: {str(trade_error)[:160]}"
+        return result
 
 
 def _tencent_orderbook(symbol):
@@ -730,8 +769,10 @@ def get_tdx_large_orders(
         return {
             "status": "success",
             "symbol": clean_symbol,
-            "source": "东方财富公开成交明细",
-            "data_level": "public_trade_prints_not_exchange_l2",
+            "source": df.attrs.get("source", "东方财富公开成交明细"),
+            "data_level": df.attrs.get("data_level", "public_trade_prints_inferred_side"),
+            "degraded": bool(df.attrs.get("degraded", False)),
+            "degraded_reason": df.attrs.get("degraded_reason"),
             "as_of": _china_now().isoformat(timespec="seconds"),
             "threshold_wan": min_amount_wan,
             "summary": {
@@ -741,7 +782,7 @@ def get_tdx_large_orders(
                 "inferred_net_wan": round(float(net_inflow), 2),
             },
             "recent_large_orders": _json_records(large_df.tail(limit)),
-            "warning": "成交方向为行情源推断；不能等同于真实委托单或主力账户行为。",
+            "warning": "逐笔可用时按成交打印筛选；降级时每条代表一分钟聚合成交额，不能称为单笔大单。方向均为行情代理推断。",
         }
     except Exception as e:
         return {"status": "error", "message": f"提取逐笔大单失败: {str(e)}"}
@@ -1182,12 +1223,14 @@ def get_stock_l2_ticks(
         return {
             "status": "success",
             "symbol": clean_symbol,
-            "source": "东方财富公开成交明细",
-            "data_level": "public_trade_prints_not_exchange_l2",
+            "source": df.attrs.get("source", "东方财富公开成交明细"),
+            "data_level": df.attrs.get("data_level", "public_trade_prints_inferred_side"),
+            "degraded": bool(df.attrs.get("degraded", False)),
+            "degraded_reason": df.attrs.get("degraded_reason"),
             "as_of": _china_now().isoformat(timespec="seconds"),
             "count": len(records),
             "ticks": records,
-            "warning": "买卖盘性质为行情源推断，不是交易所逐笔委托队列。",
+            "warning": "逐笔上游不可用时会降级为一分钟成交额及价格方向代理；不是交易所逐笔委托队列。",
         }
     except Exception as e:
         return {"status": "error", "message": f"成交明细获取失败: {str(e)}"}
@@ -1205,7 +1248,12 @@ def get_intraday_absorption(
     """
     try:
         clean_symbol = _clean_a_symbol(symbol)
-        ticks = _eastmoney_intraday(clean_symbol).tail(recent_trades).copy()
+        all_ticks = _eastmoney_intraday(clean_symbol)
+        data_level = all_ticks.attrs.get("data_level", "public_trade_prints_inferred_side")
+        source_name = all_ticks.attrs.get("source", "东方财富公开成交明细")
+        degraded = bool(all_ticks.attrs.get("degraded", False))
+        degraded_reason = all_ticks.attrs.get("degraded_reason")
+        ticks = all_ticks.tail(recent_trades).copy()
         quote = _tencent_orderbook(clean_symbol)
         if ticks.empty:
             raise ValueError("暂无可计算的成交明细")
@@ -1251,8 +1299,10 @@ def get_intraday_absorption(
             "status": "success",
             "symbol": clean_symbol,
             "name": quote["name"],
-            "source": ["东方财富公开成交明细", "腾讯公开五档快照"],
-            "data_level": "public_market_inference_not_exchange_l2",
+            "source": [source_name, "腾讯公开五档快照"],
+            "data_level": data_level,
+            "degraded": degraded,
+            "degraded_reason": degraded_reason,
             "as_of": _china_now().isoformat(timespec="seconds"),
             "quote_time": quote["quote_time"],
             "sample_trade_count": int(len(ticks)),
@@ -1286,7 +1336,7 @@ def get_intraday_absorption(
                 "inferred_sell_wan": round(large_sell_wan, 2),
                 "inferred_net_wan": round(large_buy_wan - large_sell_wan, 2),
             },
-            "warning": "承接强弱基于公开成交方向推断与五档瞬时挂单；挂单可撤，不代表真实机构账户或确定性资金流。",
+            "warning": "承接强弱基于公开成交或一分钟方向代理与五档瞬时挂单；挂单可撤，不代表真实机构账户或确定性资金流。",
         }
     except Exception as exc:
         return {"status": "error", "message": f"分时承接计算失败: {str(exc)}"}
