@@ -694,8 +694,8 @@ def _tencent_orderbook(symbol):
     }
 
 
-def _eastmoney_fund_rank(indicator, limit, descending=True):
-    """只请求资金榜所需的头部/尾部记录，避免 AKShare 全市场分页带来的超时和空响应。"""
+def _eastmoney_fund_rank(indicator, limit):
+    """一次读取精简字段的全市场资金榜，在本地同时生成流入和流出榜。"""
     config = {
         "今日": ("f62", "f3", "f62", "f184", "f66", "f69", "f72", "f75"),
         "3日": ("f267", "f127", "f267", "f268", "f269", "f270", "f271", "f272"),
@@ -708,8 +708,8 @@ def _eastmoney_fund_rank(indicator, limit, descending=True):
         "https://push2.eastmoney.com/api/qt/clist/get",
         params={
             "fid": fid,
-            "po": "1" if descending else "0",
-            "pz": str(limit),
+            "po": "1",
+            "pz": "6000",
             "pn": "1",
             "np": "1",
             "fltt": "2",
@@ -747,7 +747,15 @@ def _eastmoney_fund_rank(indicator, limit, descending=True):
         })
     if not rows:
         raise ValueError("东方财富资金榜未返回记录")
-    return rows
+    rows.sort(key=lambda item: item.get("main_net_yuan") if item.get("main_net_yuan") is not None else float("-inf"), reverse=True)
+    for rank, item in enumerate(rows, start=1):
+        item["rank"] = rank
+    top_inflow = rows[:limit]
+    valid = [item for item in rows if item.get("main_net_yuan") is not None]
+    top_outflow = sorted(valid, key=lambda item: item["main_net_yuan"])[:limit]
+    for rank, item in enumerate(top_outflow, start=1):
+        item["outflow_rank"] = rank
+    return top_inflow, top_outflow
 
 @app.get("/api/tdx_large_orders")
 def get_tdx_large_orders(
@@ -1088,8 +1096,7 @@ def get_stock_fund_flow_rank(
     if indicator not in {"今日", "3日", "5日", "10日"}:
         raise HTTPException(status_code=422, detail="indicator 参数无效")
     try:
-        inflow = _eastmoney_fund_rank(indicator, limit, descending=True)
-        outflow = _eastmoney_fund_rank(indicator, limit, descending=False)
+        inflow, outflow = _eastmoney_fund_rank(indicator, limit)
         return {
             "status": "success",
             "source": "东方财富资金流向",
