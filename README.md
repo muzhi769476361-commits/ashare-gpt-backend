@@ -30,6 +30,29 @@ GET /api/market_snapshot?refresh=true
 
 这是面向分析的近实时公开行情快照，不是交易所授权的逐笔流式行情，不应作为自动下单的唯一依据。
 
+## 竞价榜、盘口、大单与热榜
+
+- `GET /api/auction_amount_rank?page=1&page_size=100`：09:15-09:30 集合竞价窗口内的全市场成交额排名；盘中不会拿全天成交额冒充竞价额。
+- `GET /api/orderbook?symbol=600519&depth=5`：HTTPS 公开行情五档盘口；`depth=10` 会明确返回降级状态，不伪造十档。
+- `GET /api/tdx_large_orders?symbol=600519&min_amount_wan=100&limit=100`：东方财富当日成交明细的大额成交筛选。
+- `GET /api/stock_l2_ticks?symbol=600519&limit=100`：公开成交明细与行情源推断方向。
+- `GET /api/hot_rank?source=auto&limit=20`：优先同花顺（若当前 AKShare 支持），否则返回东方财富人气榜并标明真实来源。
+- `GET /api/data_capabilities`：向 GPT 明示当前数据授权级别和可用性。
+
+资金监控接口：
+
+- `GET /api/market_fund_flow?limit=20`：大盘主力、超大单、大单、中单和小单资金流；
+- `GET /api/stock_fund_flow?symbol=600519&limit=20`：个股日级资金流；
+- `GET /api/stock_fund_flow_rank?indicator=今日&limit=30`：个股净流入/净流出双向排行；
+- `GET /api/sector_fund_flow?sector_type=行业资金流&indicator=今日&limit=20`：行业、概念或地域资金双向排行；
+- `GET /api/lhb_detail?date=20260924&limit=50`：当日龙虎榜总表（盘后披露）；
+- `GET /api/lhb_stock_detail?symbol=600519&date=20260924`：个股龙虎榜买卖席位；
+- `GET /api/intraday_absorption?symbol=600519&recent_trades=300&large_trade_wan=100`：结合逐笔成交、VWAP、大额成交与五档盘口的分时承接评分。
+
+“分时承接”是公开行情量化推断，不是账户级真实资金流水。接口会同时返回样本数、数据时间、计算分项与风险提示，供专业分析复核。
+
+当前免费公开源只能稳定提供五档快照。A 股真实十档盘口、逐笔委托与委托队列属于授权 Level-2 行情，需接入券商/交易所授权数据源（例如具备相应行情权限的 Futu OpenD 或券商量化终端）。接口不会把五档扩写成十档，也不会把成交方向推断描述成真实主力账户行为。
+
 ## 接入自定义 GPT
 
 在 GPT 编辑器的“操作”中选择“通过 URL 导入”，填写：
@@ -79,3 +102,4 @@ python -m venv .venv
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
