@@ -561,91 +561,133 @@ def get_market_snapshot(
         _market_snapshot_cache["expires_at"] = time.monotonic() + MARKET_SNAPSHOT_TTL_SECONDS
         return result
 
-# ==================== 0. 通达信 (pytdx) 逐笔大单实时监控模块 ====================
+# ==================== 0. 公开逐笔成交与大单监控模块 ====================
+
+
+def _clean_a_symbol(symbol):
+    clean_symbol = "".join(filter(str.isdigit, symbol or ""))
+    if len(clean_symbol) != 6:
+        raise HTTPException(status_code=422, detail="A股代码必须为6位数字")
+    return clean_symbol
+
+
+def _eastmoney_intraday(symbol):
+    """HTTP 方式读取东方财富当日成交明细，避免 Render 无法访问 7709 端口。"""
+    market_code = 1 if symbol.startswith(("6", "9")) else 0
+    response = requests.get(
+        "https://70.push2.eastmoney.com/api/qt/stock/details/sse",
+        params={
+            "fields1": "f1,f2,f3,f4",
+            "fields2": "f51,f52,f53,f54,f55",
+            "mpi": "2000",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "pos": "-0",
+            "secid": f"{market_code}.{symbol}",
+            "wbp2u": "|0|0|0|web",
+        },
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        stream=True,
+        timeout=(6, 20),
+    )
+    response.raise_for_status()
+    event_lines = []
+    payload = None
+    for raw_line in response.iter_lines():
+        if raw_line:
+            line = raw_line.decode("utf-8", errors="replace")
+            if line.startswith("data:"):
+                event_lines.append(line[5:].strip())
+        elif event_lines:
+            payload = json.loads("\n".join(event_lines))
+            break
+    response.close()
+    details = ((payload or {}).get("data") or {}).get("details") or []
+    if not details:
+        raise ValueError("东方财富未返回当日成交明细")
+    rows = [item.split(",") for item in details]
+    df = pd.DataFrame(rows, columns=["time", "price", "vol", "_sequence", "side_code"])
+    side_map = {"2": "买盘", "1": "卖盘", "4": "中性盘"}
+    result = pd.DataFrame({
+        "time": df["time"].astype(str),
+        "price": pd.to_numeric(df["price"], errors="coerce"),
+        "vol": pd.to_numeric(df["vol"], errors="coerce"),
+        "side": df["side_code"].map(side_map).fillna("未知"),
+    }).dropna(subset=["price", "vol"])
+    result["amount_wan"] = (result["price"] * result["vol"] * 100 / 10000).round(2)
+    return result
+
+
+def _tencent_orderbook(symbol):
+    """腾讯公开行情的买卖五档；这是 Level-1 五档快照，不冒充交易所 L2。"""
+    prefix = "sh" if symbol.startswith(("6", "688", "900")) else "sz"
+    response = requests.get(
+        f"https://qt.gtimg.cn/q={prefix}{symbol}",
+        headers={"Referer": "https://finance.qq.com/", "User-Agent": "Mozilla/5.0"},
+        timeout=12,
+    )
+    response.raise_for_status()
+    text = response.content.decode("gbk", errors="replace")
+    if '="' not in text:
+        raise ValueError("腾讯行情未返回有效盘口")
+    fields = text.split('="', 1)[1].rstrip('";\r\n').split("~")
+    if len(fields) < 31:
+        raise ValueError("腾讯盘口字段不完整")
+
+    def level(price_index, volume_index, level):
+        return {
+            "level": level,
+            "price": _number(fields[price_index]),
+            "volume_lots": _number(fields[volume_index], 0),
+        }
+
+    bids = [level(9 + (i - 1) * 2, 10 + (i - 1) * 2, i) for i in range(1, 6)]
+    asks = [level(19 + (i - 1) * 2, 20 + (i - 1) * 2, i) for i in range(1, 6)]
+    return {
+        "name": fields[1],
+        "last_price": _number(fields[3]),
+        "previous_close": _number(fields[4]),
+        "open": _number(fields[5]),
+        "total_volume_lots": _number(fields[6], 0),
+        "quote_time": fields[30],
+        "bids": bids,
+        "asks": asks,
+    }
 
 @app.get("/api/tdx_large_orders")
 def get_tdx_large_orders(
     symbol: str = Query(..., description="A股代码，如 600519 或 000001"),
-    min_amount_wan: float = Query(100.0, description="单笔成交金额门槛（单位：万元），默认100万")
+    min_amount_wan: float = Query(100.0, ge=1, description="单笔成交金额门槛（万元）"),
+    limit: int = Query(100, ge=1, le=500, description="最多返回多少笔大单")
 ):
     """
-    基于 pytdx 直连通达信服务器，拉取今日最新逐笔成交明细，并筛选出单笔金额大于指定门槛的主力超大单（用于精准识别吸筹/砸盘）
+    从东方财富 HTTP 行情读取当日成交明细并筛选大额成交。
+    买卖方向来自公开行情的成交方向推断，不等同于交易所委托逐笔，也不能单独证明吸筹或出货。
     """
-    clean_symbol = "".join(filter(str.isdigit, symbol))
-    market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0  # 1 为沪市, 0 为深市
-    
-    api = TdxHq_API(heartbeat=True)
-    hosts = [
-        {"ip": "119.147.212.81", "port": 7709},
-        {"ip": "114.80.63.12", "port": 7709},
-        {"ip": "47.103.48.45", "port": 7709}
-    ]
-    
-    connected = False
-    for host in hosts:
-        if api.connect(host["ip"], host["port"]):
-            connected = True
-            break
-            
-    if not connected:
-        return {"status": "error", "message": "无法连接至通达信行情服务器，请稍后重试"}
-        
     try:
-        all_transactions = []
-        start_pos = 0
-        while True:
-            data = api.get_transaction_data(market, clean_symbol, start_pos, 2000)
-            if not data or len(data) == 0:
-                break
-            all_transactions.extend(data)
-            if len(data) < 2000:
-                break
-            start_pos += len(data)
-            if start_pos >= 10000:
-                break
-                
-        api.disconnect()
-        
-        if not all_transactions:
-            return {"status": "error", "message": "未读取到该股票今日逐笔明细"}
-            
-        df = pd.DataFrame(all_transactions)
-        df['amount_wan'] = (df['price'] * df['vol'] * 100) / 10000.0
+        clean_symbol = _clean_a_symbol(symbol)
+        df = _eastmoney_intraday(clean_symbol)
         large_df = df[df['amount_wan'] >= min_amount_wan].copy()
-        
-        if large_df.empty:
-            return {
-                "status": "success",
-                "symbol": clean_symbol,
-                "message": f"今日暂未发现单笔金额大于 {min_amount_wan} 万元的超大单",
-                "data": []
-            }
-            
-        type_map = {0: "主动买单(吃单/吸筹)", 1: "主动卖单(砸盘/出货)", 2: "中性单"}
-        large_df['order_type'] = large_df['buyorsell'].map(type_map)
-        
-        buy_sum = large_df[large_df['buyorsell'] == 0]['amount_wan'].sum()
-        sell_sum = large_df[large_df['buyorsell'] == 1]['amount_wan'].sum()
+        buy_sum = large_df[large_df['side'].str.contains("买", na=False)]['amount_wan'].sum()
+        sell_sum = large_df[large_df['side'].str.contains("卖", na=False)]['amount_wan'].sum()
         net_inflow = buy_sum - sell_sum
-        
-        summary = {
-            "大单定义门槛": f"{min_amount_wan} 万元/笔",
-            "大单成交总笔数": len(large_df),
-            "主力大单主动买入额": f"{round(buy_sum, 2)} 万元",
-            "主力大单主动卖出额": f"{round(sell_sum, 2)} 万元",
-            "主力大单净流入额": f"{round(net_inflow, 2)} 万元"
-        }
-        
-        records = large_df[['time', 'price', 'vol', 'amount_wan', 'order_type']].tail(30).to_dict(orient="records")
-        
         return {
             "status": "success",
             "symbol": clean_symbol,
-            "summary": summary,
-            "recent_large_orders": records
+            "source": "东方财富公开成交明细",
+            "data_level": "public_trade_prints_not_exchange_l2",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "threshold_wan": min_amount_wan,
+            "summary": {
+                "large_trade_count": int(len(large_df)),
+                "inferred_buy_wan": round(float(buy_sum), 2),
+                "inferred_sell_wan": round(float(sell_sum), 2),
+                "inferred_net_wan": round(float(net_inflow), 2),
+            },
+            "recent_large_orders": _json_records(large_df.tail(limit)),
+            "warning": "成交方向为行情源推断；不能等同于真实委托单或主力账户行为。",
         }
     except Exception as e:
-        api.disconnect()
         return {"status": "error", "message": f"提取逐笔大单失败: {str(e)}"}
 
 # ==================== 1. 同花顺 (10jqka) 顶级游资与量化模块 ====================
@@ -680,14 +722,140 @@ def get_ths_wencai(query: str = Query(..., description="同花顺问财条件，
         return {"status": "error", "message": f"问财接口查询失败: {str(e)}"}
 
 @app.get("/api/ths_hot_rank")
-def get_ths_hot_rank(limit: int = Query(20, description="热搜榜前多少名")):
+@app.get("/api/hot_rank")
+def get_ths_hot_rank(
+    limit: int = Query(20, ge=1, le=100, description="热榜前多少名"),
+    source: str = Query("auto", description="auto、eastmoney 或 ths"),
+):
+    """热度榜。旧路径保留兼容；同花顺函数不可用时自动降级到东方财富人气榜。"""
+    errors = []
+    source = source.lower().strip()
+    if source not in {"auto", "eastmoney", "ths"}:
+        raise HTTPException(status_code=422, detail="source 只能是 auto、eastmoney 或 ths")
+
+    if source in {"auto", "ths"} and hasattr(ak, "stock_hot_rank_wc"):
+        try:
+            df = ak.stock_hot_rank_wc()
+            if df is not None and not df.empty:
+                return {
+                    "status": "success",
+                    "source": "同花顺问财热榜",
+                    "as_of": _china_now().isoformat(timespec="seconds"),
+                    "count": min(limit, len(df)),
+                    "data": _json_records(df, limit),
+                }
+        except Exception as exc:
+            errors.append(f"同花顺: {str(exc)[:160]}")
+
+    if source == "ths":
+        return {
+            "status": "unavailable",
+            "source": "同花顺",
+            "message": "当前 AKShare 版本或上游未提供同花顺热榜，未用其他榜单冒充。",
+            "errors": errors,
+        }
+
     try:
-        df = ak.stock_hot_rank_wc()
+        df = ak.stock_hot_rank_em()
         if df.empty:
-            return {"status": "error", "message": "未能获取同花顺热榜数据"}
-        return {"status": "success", "source": "同花顺", "data": df.head(limit).to_dict(orient="records")}
+            return {"status": "error", "message": "未能获取东方财富人气榜数据"}
+        return {
+            "status": "success",
+            "source": "东方财富个股人气榜",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "count": min(limit, len(df)),
+            "data": _json_records(df, limit),
+            "fallback_errors": errors,
+        }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": str(e), "fallback_errors": errors}
+
+
+@app.get("/api/auction_amount_rank")
+def get_auction_amount_rank(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(100, ge=1, le=500, description="每页数量，最多500"),
+):
+    """
+    集合竞价时段的全市场成交额排名。只有 09:15-09:30 期间的实时快照可称为竞价金额；
+    连续竞价开始后不拿全天成交额冒充竞价金额。
+    """
+    now = _china_now()
+    current = now.time()
+    if now.weekday() >= 5 or not (datetime.time(9, 15) <= current < datetime.time(9, 30)):
+        return {
+            "status": "unavailable",
+            "as_of": now.isoformat(timespec="seconds"),
+            "session": _market_session(now)[0],
+            "message": "当前不在09:15-09:30集合竞价窗口，未用盘中成交额冒充竞价金额。",
+            "required_for_history": "如需盘后查询完整竞价榜，需在09:25定时落库保存当日快照。",
+        }
+    try:
+        df = ak.stock_zh_a_spot_em()
+        amount_col = _first_column(df, "成交额", "amount")
+        code_col = _first_column(df, "代码", "code")
+        name_col = _first_column(df, "名称", "name")
+        price_col = _first_column(df, "最新价", "price")
+        pct_col = _first_column(df, "涨跌幅", "change_pct")
+        volume_col = _first_column(df, "成交量", "volume")
+        if not amount_col or not code_col:
+            raise ValueError("全市场快照缺少成交额或代码字段")
+        ranked = df.assign(_amount=pd.to_numeric(df[amount_col], errors="coerce"))
+        ranked = ranked.dropna(subset=["_amount"]).sort_values("_amount", ascending=False)
+        start = (page - 1) * page_size
+        rows = []
+        for rank, (_, row) in enumerate(ranked.iloc[start:start + page_size].iterrows(), start=start + 1):
+            rows.append({
+                "rank": rank,
+                "code": str(row[code_col]),
+                "name": str(row[name_col]) if name_col else None,
+                "auction_price": _number(row[price_col]) if price_col else None,
+                "change_pct": _number(row[pct_col]) if pct_col else None,
+                "matched_volume_lots": _number(row[volume_col], 0) if volume_col else None,
+                "auction_amount_yuan": _number(row[amount_col], 2),
+            })
+        return {
+            "status": "success",
+            "source": "东方财富A股实时全市场快照",
+            "data_level": "public_snapshot",
+            "as_of": now.isoformat(timespec="seconds"),
+            "session": "call_auction",
+            "total": int(len(ranked)),
+            "page": page,
+            "page_size": page_size,
+            "data": rows,
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"竞价金额榜获取失败: {str(exc)}"}
+
+
+@app.get("/api/data_capabilities")
+def get_data_capabilities():
+    """让 GPT 在调用前知道哪些数据是真实可用、哪些需要付费行情授权。"""
+    return {
+        "as_of": _china_now().isoformat(timespec="seconds"),
+        "capabilities": {
+            "auction_amount_rank": {
+                "available": True,
+                "window": "Asia/Shanghai 09:15-09:30",
+                "history": False,
+            },
+            "orderbook_5": {"available": True, "level": "public_level1_snapshot"},
+            "orderbook_10": {
+                "available": False,
+                "level": "licensed_level2_required",
+                "recommended_adapter": "Futu OpenD or a broker/exchange-authorized L2 feed",
+            },
+            "large_orders": {"available": True, "level": "public_trade_prints_inferred_side"},
+            "hot_rank": {"available": True, "sources": ["eastmoney", "ths_if_upstream_available"]},
+            "market_fund_flow": {"available": True, "frequency": "daily_and_intraday_upstream_snapshot"},
+            "stock_fund_flow": {"available": True, "frequency": "daily"},
+            "stock_fund_flow_rank": {"available": True, "windows": ["今日", "3日", "5日", "10日"]},
+            "sector_fund_flow": {"available": True, "scopes": ["行业", "概念", "地域"]},
+            "lhb": {"available": True, "freshness": "exchange_post_close_disclosure"},
+            "intraday_absorption": {"available": True, "level": "quant_inference_from_public_trades_and_level1_book"},
+        },
+    }
 
 @app.get("/api/ths_board_concept")
 def get_ths_board_concept():
@@ -748,21 +916,146 @@ def get_stock_us(symbol: str = Query(..., description="美股代码")):
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/sector_fund_flow")
-def get_sector_fund_flow(sector_type: str = Query("行业资金流", description="'行业资金流' 或 '概念资金流'")):
+def get_sector_fund_flow(
+    sector_type: str = Query("行业资金流", description="行业资金流、概念资金流或地域资金流"),
+    indicator: str = Query("今日", description="今日、5日或10日"),
+    limit: int = Query(20, ge=1, le=100),
+):
     try:
-        df = ak.stock_fund_flow_concept(symbol="即时") if sector_type == "概念资金流" else ak.stock_fund_flow_industry(symbol="即时")
-        return {"status": "success", "type": sector_type, "data": df.head(20).to_dict(orient="records")}
+        if sector_type not in {"行业资金流", "概念资金流", "地域资金流"}:
+            raise HTTPException(status_code=422, detail="sector_type 参数无效")
+        if indicator not in {"今日", "5日", "10日"}:
+            raise HTTPException(status_code=422, detail="indicator 参数无效")
+        df = ak.stock_sector_fund_flow_rank(indicator=indicator, sector_type=sector_type)
+        net_col = _first_column(df, f"{indicator}主力净流入-净额", "主力净流入-净额", "净额")
+        inflow = df.sort_values(net_col, ascending=False).head(limit) if net_col else df.head(limit)
+        outflow = df.sort_values(net_col, ascending=True).head(limit) if net_col else pd.DataFrame()
+        return {
+            "status": "success",
+            "source": "东方财富资金流向",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "type": sector_type,
+            "indicator": indicator,
+            "unit_note": "净额字段单位沿用上游东方财富定义，通常为元",
+            "top_inflow": _json_records(inflow),
+            "top_outflow": _json_records(outflow),
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.get("/api/lhb_detail")
-def get_lhb_detail(date: str = Query(None, description="YYYYMMDD")):
+
+@app.get("/api/market_fund_flow")
+def get_market_fund_flow(limit: int = Query(20, ge=1, le=120, description="返回最近交易日数量")):
+    """大盘主力、超大单、大单、中单和小单的日级资金流。"""
     try:
-        date = date or datetime.datetime.now().strftime("%Y%m%d")
+        df = ak.stock_market_fund_flow()
+        return {
+            "status": "success",
+            "source": "东方财富资金流向",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "count": min(limit, len(df)),
+            "data": _json_records(df.tail(limit)),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"大盘资金流获取失败: {str(exc)}"}
+
+
+@app.get("/api/stock_fund_flow")
+def get_stock_fund_flow(
+    symbol: str = Query(..., description="A股6位代码"),
+    limit: int = Query(20, ge=1, le=120, description="返回最近交易日数量"),
+):
+    """个股日级主力/超大单/大单/中单/小单净流入及占比。"""
+    try:
+        clean_symbol = _clean_a_symbol(symbol)
+        market = "sh" if clean_symbol.startswith(("6", "9")) else ("bj" if clean_symbol.startswith(("4", "8")) else "sz")
+        df = ak.stock_individual_fund_flow(stock=clean_symbol, market=market)
+        return {
+            "status": "success",
+            "source": "东方财富资金流向",
+            "symbol": clean_symbol,
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "count": min(limit, len(df)),
+            "data": _json_records(df.tail(limit)),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"个股资金流获取失败: {str(exc)}"}
+
+
+@app.get("/api/stock_fund_flow_rank")
+def get_stock_fund_flow_rank(
+    indicator: str = Query("今日", description="今日、3日、5日或10日"),
+    limit: int = Query(30, ge=1, le=100),
+):
+    """A股个股主力资金净流入和净流出双向排行榜。"""
+    if indicator not in {"今日", "3日", "5日", "10日"}:
+        raise HTTPException(status_code=422, detail="indicator 参数无效")
+    try:
+        df = ak.stock_individual_fund_flow_rank(indicator=indicator)
+        net_col = _first_column(df, f"{indicator}主力净流入-净额", "主力净流入-净额")
+        if not net_col:
+            raise ValueError("上游返回数据缺少主力净流入字段")
+        return {
+            "status": "success",
+            "source": "东方财富资金流向",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "indicator": indicator,
+            "unit_note": "净额字段单位沿用上游东方财富定义，通常为元",
+            "top_inflow": _json_records(df.sort_values(net_col, ascending=False).head(limit)),
+            "top_outflow": _json_records(df.sort_values(net_col, ascending=True).head(limit)),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"个股资金排名获取失败: {str(exc)}"}
+
+@app.get("/api/lhb_detail")
+def get_lhb_detail(
+    date: str = Query(None, description="YYYYMMDD；不传则使用北京时间当天"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    try:
+        date = date or _china_now().strftime("%Y%m%d")
         df = ak.stock_lhb_detail_em(start_date=date, end_date=date)
-        return {"status": "success", "date": date, "data": df.head(30).to_dict(orient="records")}
+        if df.empty:
+            return {
+                "status": "empty",
+                "date": date,
+                "message": "该日期暂无龙虎榜数据；盘中通常需等待交易所盘后披露。",
+                "data": [],
+            }
+        net_col = _first_column(df, "龙虎榜净买额", "净买额", "净额")
+        ranked = df.sort_values(net_col, ascending=False) if net_col else df
+        return {
+            "status": "success",
+            "source": "东方财富龙虎榜",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "date": date,
+            "count": min(limit, len(ranked)),
+            "data": _json_records(ranked, limit),
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/lhb_stock_detail")
+def get_lhb_stock_detail(
+    symbol: str = Query(..., description="A股6位代码"),
+    date: str = Query(..., description="YYYYMMDD"),
+):
+    """指定个股、指定上榜日的买入和卖出营业部/机构席位明细。"""
+    try:
+        clean_symbol = _clean_a_symbol(symbol)
+        buy_df = ak.stock_lhb_stock_detail_em(symbol=clean_symbol, date=date, flag="买入")
+        sell_df = ak.stock_lhb_stock_detail_em(symbol=clean_symbol, date=date, flag="卖出")
+        return {
+            "status": "success",
+            "source": "东方财富龙虎榜",
+            "symbol": clean_symbol,
+            "date": date,
+            "buy_seats": _json_records(buy_df),
+            "sell_seats": _json_records(sell_df),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"个股龙虎榜席位获取失败: {str(exc)}"}
 
 @app.get("/api/cls_telegraph")
 def get_cls_telegraph(limit: int = Query(20)):
@@ -782,68 +1075,42 @@ def get_sina_news(limit: int = Query(20)):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# ==================== 3. Level 2 (L2) 盘口与逐笔极速查询模块 ====================
+# ==================== 3. 盘口与成交明细模块 ====================
 
 @app.get("/api/stock_l2_orderbook")
-def get_stock_l2_orderbook(symbol: str = Query(..., description="A股代码，如 600519 或 000001")):
+@app.get("/api/orderbook")
+def get_stock_l2_orderbook(
+    symbol: str = Query(..., description="A股代码，如 600519 或 000001"),
+    depth: int = Query(5, ge=1, le=10, description="请求档位数；公开源最多返回5档"),
+):
     """
-    通过 pytdx 直连行情服务器，获取实时 L2 买卖五档盘口（报价与挂单量）及最新价格。
+    获取 A 股实时买卖盘口。Render 无法稳定访问通达信 7709 端口，因此改用 HTTPS 行情源。
+    当前公开源是五档 Level-1；请求十档时明确降级，绝不伪造第六至十档。
     """
-    clean_symbol = "".join(filter(str.isdigit, symbol))
-    market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0
-    
-    api = TdxHq_API(heartbeat=True)
-    hosts = [
-        {"ip": "119.147.212.81", "port": 7709},
-        {"ip": "114.80.63.12", "port": 7709},
-        {"ip": "47.103.48.45", "port": 7709}
-    ]
-    
-    connected = False
-    for host in hosts:
-        if api.connect(host["ip"], host["port"]):
-            connected = True
-            break
-            
-    if not connected:
-        return {"status": "error", "message": "无法连接至行情服务器"}
-        
     try:
-        quotes = api.get_security_quotes([(market, clean_symbol)])
-        api.disconnect()
-        
-        if not quotes:
-            return {"status": "error", "message": "未能获取盘口数据"}
-            
-        q = quotes[0]
-        bid_ask = {
-            "buy_5": {"price": q.get("b5_price"), "vol": q.get("b5_vol")},
-            "buy_4": {"price": q.get("b4_price"), "vol": q.get("b4_vol")},
-            "buy_3": {"price": q.get("b3_price"), "vol": q.get("b3_vol")},
-            "buy_2": {"price": q.get("b2_price"), "vol": q.get("b2_vol")},
-            "buy_1": {"price": q.get("b1_price"), "vol": q.get("b1_vol")},
-            "sell_1": {"price": q.get("a1_price"), "vol": q.get("a1_vol")},
-            "sell_2": {"price": q.get("a2_price"), "vol": q.get("a2_vol")},
-            "sell_3": {"price": q.get("a3_price"), "vol": q.get("a3_vol")},
-            "sell_4": {"price": q.get("a4_price"), "vol": q.get("a4_vol")},
-            "sell_5": {"price": q.get("a5_price"), "vol": q.get("a5_vol")},
-        }
-        
+        clean_symbol = _clean_a_symbol(symbol)
+        quote = _tencent_orderbook(clean_symbol)
+        actual_depth = min(5, depth)
         return {
             "status": "success",
             "symbol": clean_symbol,
-            "last_price": q.get("price"),
-            "open": q.get("open"),
-            "high": q.get("high"),
-            "low": q.get("low"),
-            "last_close": q.get("last_close"),
-            "total_vol": q.get("vol"),
-            "amount": q.get("amount"),
-            "orderbook": bid_ask
+            "source": "腾讯公开行情",
+            "data_level": "public_level1_snapshot",
+            "requested_depth": depth,
+            "actual_depth": actual_depth,
+            "degraded": depth > actual_depth,
+            "degraded_reason": "A股真实十档盘口需要已授权的 Level-2 数据源" if depth > 5 else None,
+            "name": quote["name"],
+            "last_price": quote["last_price"],
+            "previous_close": quote["previous_close"],
+            "open": quote["open"],
+            "quote_time": quote["quote_time"],
+            "volume_unit": "手",
+            "bids": quote["bids"][:actual_depth],
+            "asks": quote["asks"][:actual_depth],
         }
     except Exception as e:
-        api.disconnect()
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"盘口获取失败: {str(e)}"}
 
 
 @app.get("/api/stock_l2_ticks")
@@ -852,51 +1119,125 @@ def get_stock_l2_ticks(
     limit: int = Query(50, ge=1, le=500, description="返回最新逐笔条数")
 ):
     """
-    获取实时分时逐笔成交明细（包含精准时间、成交价、成交量手及买卖方向属性）。
+    获取当日成交明细。公开源提供的是成交打印与方向推断，并非交易所 Level-2 委托逐笔。
     """
-    clean_symbol = "".join(filter(str.isdigit, symbol))
-    market = 1 if clean_symbol.startswith(("6", "688", "900")) else 0
-    
-    api = TdxHq_API(heartbeat=True)
-    hosts = [
-        {"ip": "119.147.212.81", "port": 7709},
-        {"ip": "114.80.63.12", "port": 7709},
-        {"ip": "47.103.48.45", "port": 7709}
-    ]
-    
-    connected = False
-    for host in hosts:
-        if api.connect(host["ip"], host["port"]):
-            connected = True
-            break
-            
-    if not connected:
-        return {"status": "error", "message": "无法连接至行情服务器"}
-        
     try:
-        data = api.get_transaction_data(market, clean_symbol, 0, limit)
-        api.disconnect()
-        
-        if not data:
-            return {"status": "error", "message": "暂无逐笔明细数据"}
-            
-        df = pd.DataFrame(data)
-        type_map = {0: "主动买单", 1: "主动卖单", 2: "中性单"}
-        df['type'] = df['buyorsell'].map(type_map)
-        df['amount_wan'] = (df['price'] * df['vol'] * 100) / 10000.0
-        df['amount_wan'] = df['amount_wan'].round(2)
-        
-        records = df[['time', 'price', 'vol', 'amount_wan', 'type']].to_dict(orient="records")
+        clean_symbol = _clean_a_symbol(symbol)
+        df = _eastmoney_intraday(clean_symbol)
+        records = _json_records(df.tail(limit))
         return {
             "status": "success",
             "symbol": clean_symbol,
+            "source": "东方财富公开成交明细",
+            "data_level": "public_trade_prints_not_exchange_l2",
+            "as_of": _china_now().isoformat(timespec="seconds"),
             "count": len(records),
-            "ticks": records
+            "ticks": records,
+            "warning": "买卖盘性质为行情源推断，不是交易所逐笔委托队列。",
         }
     except Exception as e:
-        api.disconnect()
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"成交明细获取失败: {str(e)}"}
+
+
+@app.get("/api/intraday_absorption")
+def get_intraday_absorption(
+    symbol: str = Query(..., description="A股6位代码"),
+    recent_trades: int = Query(300, ge=20, le=2000, description="用于计算的最近成交笔数"),
+    large_trade_wan: float = Query(100.0, ge=1, description="大额成交门槛，万元"),
+):
+    """
+    用最近成交打印、推断买卖方向、VWAP 与五档盘口失衡度衡量短线承接。
+    结果是盘面量化信号，不是账户级资金流，也不是买卖建议。
+    """
+    try:
+        clean_symbol = _clean_a_symbol(symbol)
+        ticks = _eastmoney_intraday(clean_symbol).tail(recent_trades).copy()
+        quote = _tencent_orderbook(clean_symbol)
+        if ticks.empty:
+            raise ValueError("暂无可计算的成交明细")
+
+        buy_mask = ticks["side"].str.contains("买", na=False)
+        sell_mask = ticks["side"].str.contains("卖", na=False)
+        buy_wan = float(ticks.loc[buy_mask, "amount_wan"].sum())
+        sell_wan = float(ticks.loc[sell_mask, "amount_wan"].sum())
+        neutral_wan = float(ticks.loc[~(buy_mask | sell_mask), "amount_wan"].sum())
+        total_wan = float(ticks["amount_wan"].sum())
+        active_net_wan = buy_wan - sell_wan
+        active_ratio = active_net_wan / (buy_wan + sell_wan) if buy_wan + sell_wan else 0.0
+
+        shares = ticks["vol"] * 100
+        vwap = float((ticks["price"] * shares).sum() / shares.sum()) if shares.sum() else None
+        first_price = float(ticks.iloc[0]["price"])
+        last_price = float(ticks.iloc[-1]["price"])
+        recent_change_pct = (last_price / first_price - 1) * 100 if first_price else None
+
+        bid_notional_wan = sum(
+            (item["price"] or 0) * (item["volume_lots"] or 0) * 100 / 10000
+            for item in quote["bids"]
+        )
+        ask_notional_wan = sum(
+            (item["price"] or 0) * (item["volume_lots"] or 0) * 100 / 10000
+            for item in quote["asks"]
+        )
+        book_total = bid_notional_wan + ask_notional_wan
+        book_imbalance = (bid_notional_wan - ask_notional_wan) / book_total if book_total else 0.0
+
+        large = ticks[ticks["amount_wan"] >= large_trade_wan]
+        large_buy_wan = float(large.loc[large["side"].str.contains("买", na=False), "amount_wan"].sum())
+        large_sell_wan = float(large.loc[large["side"].str.contains("卖", na=False), "amount_wan"].sum())
+
+        score = 0
+        score += 1 if active_ratio >= 0.15 else (-1 if active_ratio <= -0.15 else 0)
+        score += 1 if book_imbalance >= 0.15 else (-1 if book_imbalance <= -0.15 else 0)
+        score += 1 if vwap and last_price >= vwap else -1
+        score += 1 if large_buy_wan > large_sell_wan else (-1 if large_buy_wan < large_sell_wan else 0)
+        label = "承接偏强" if score >= 2 else ("承接偏弱" if score <= -2 else "承接中性/分歧")
+
+        return {
+            "status": "success",
+            "symbol": clean_symbol,
+            "name": quote["name"],
+            "source": ["东方财富公开成交明细", "腾讯公开五档快照"],
+            "data_level": "public_market_inference_not_exchange_l2",
+            "as_of": _china_now().isoformat(timespec="seconds"),
+            "quote_time": quote["quote_time"],
+            "sample_trade_count": int(len(ticks)),
+            "signal": {"label": label, "score": score, "score_range": [-4, 4]},
+            "trade_flow": {
+                "inferred_active_buy_wan": round(buy_wan, 2),
+                "inferred_active_sell_wan": round(sell_wan, 2),
+                "neutral_wan": round(neutral_wan, 2),
+                "inferred_active_net_wan": round(active_net_wan, 2),
+                "active_imbalance_ratio": round(active_ratio, 4),
+                "sample_total_wan": round(total_wan, 2),
+            },
+            "price_behavior": {
+                "first_price": first_price,
+                "last_price": last_price,
+                "sample_vwap": round(vwap, 4) if vwap is not None else None,
+                "last_vs_vwap_pct": round((last_price / vwap - 1) * 100, 4) if vwap else None,
+                "sample_change_pct": round(recent_change_pct, 4) if recent_change_pct is not None else None,
+            },
+            "orderbook_5": {
+                "bid_notional_wan": round(bid_notional_wan, 2),
+                "ask_notional_wan": round(ask_notional_wan, 2),
+                "imbalance_ratio": round(book_imbalance, 4),
+                "bids": quote["bids"],
+                "asks": quote["asks"],
+            },
+            "large_trades": {
+                "threshold_wan": large_trade_wan,
+                "count": int(len(large)),
+                "inferred_buy_wan": round(large_buy_wan, 2),
+                "inferred_sell_wan": round(large_sell_wan, 2),
+                "inferred_net_wan": round(large_buy_wan - large_sell_wan, 2),
+            },
+            "warning": "承接强弱基于公开成交方向推断与五档瞬时挂单；挂单可撤，不代表真实机构账户或确定性资金流。",
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"分时承接计算失败: {str(exc)}"}
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok"}
+
