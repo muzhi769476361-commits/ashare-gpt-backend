@@ -654,6 +654,62 @@ def _tencent_orderbook(symbol):
         "asks": asks,
     }
 
+
+def _eastmoney_fund_rank(indicator, limit, descending=True):
+    """只请求资金榜所需的头部/尾部记录，避免 AKShare 全市场分页带来的超时和空响应。"""
+    config = {
+        "今日": ("f62", "f3", "f62", "f184", "f66", "f69", "f72", "f75"),
+        "3日": ("f267", "f127", "f267", "f268", "f269", "f270", "f271", "f272"),
+        "5日": ("f164", "f109", "f164", "f165", "f166", "f167", "f168", "f169"),
+        "10日": ("f174", "f160", "f174", "f175", "f176", "f177", "f178", "f179"),
+    }
+    fid, pct, main_net, main_pct, xl_net, xl_pct, large_net, large_pct = config[indicator]
+    fields = ",".join(["f12", "f14", "f2", pct, main_net, main_pct, xl_net, xl_pct, large_net, large_pct, "f124"])
+    response = requests.get(
+        "https://push2.eastmoney.com/api/qt/clist/get",
+        params={
+            "fid": fid,
+            "po": "1" if descending else "0",
+            "pz": str(limit),
+            "pn": "1",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+            "fs": "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:7+f:!2,m:1+t:3+f:!2",
+            "fields": fields,
+        },
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Referer": "https://data.eastmoney.com/zjlx/detail.html",
+            "Accept": "application/json,text/plain,*/*",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    diff = ((payload.get("data") or {}).get("diff")) or []
+    if isinstance(diff, dict):
+        diff = list(diff.values())
+    rows = []
+    for rank, item in enumerate(diff, start=1):
+        rows.append({
+            "rank": rank,
+            "code": item.get("f12"),
+            "name": item.get("f14"),
+            "last_price": _number(item.get("f2")),
+            "change_pct": _number(item.get(pct)),
+            "main_net_yuan": _number(item.get(main_net), 2),
+            "main_net_ratio_pct": _number(item.get(main_pct)),
+            "extra_large_net_yuan": _number(item.get(xl_net), 2),
+            "extra_large_net_ratio_pct": _number(item.get(xl_pct)),
+            "large_net_yuan": _number(item.get(large_net), 2),
+            "large_net_ratio_pct": _number(item.get(large_pct)),
+        })
+    if not rows:
+        raise ValueError("东方财富资金榜未返回记录")
+    return rows
+
 @app.get("/api/tdx_large_orders")
 def get_tdx_large_orders(
     symbol: str = Query(..., description="A股代码，如 600519 或 000001"),
@@ -991,18 +1047,16 @@ def get_stock_fund_flow_rank(
     if indicator not in {"今日", "3日", "5日", "10日"}:
         raise HTTPException(status_code=422, detail="indicator 参数无效")
     try:
-        df = ak.stock_individual_fund_flow_rank(indicator=indicator)
-        net_col = _first_column(df, f"{indicator}主力净流入-净额", "主力净流入-净额")
-        if not net_col:
-            raise ValueError("上游返回数据缺少主力净流入字段")
+        inflow = _eastmoney_fund_rank(indicator, limit, descending=True)
+        outflow = _eastmoney_fund_rank(indicator, limit, descending=False)
         return {
             "status": "success",
             "source": "东方财富资金流向",
             "as_of": _china_now().isoformat(timespec="seconds"),
             "indicator": indicator,
-            "unit_note": "净额字段单位沿用上游东方财富定义，通常为元",
-            "top_inflow": _json_records(df.sort_values(net_col, ascending=False).head(limit)),
-            "top_outflow": _json_records(df.sort_values(net_col, ascending=True).head(limit)),
+            "unit_note": "净额单位为元",
+            "top_inflow": inflow,
+            "top_outflow": outflow,
         }
     except Exception as exc:
         return {"status": "error", "message": f"个股资金排名获取失败: {str(exc)}"}
