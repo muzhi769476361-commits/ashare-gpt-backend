@@ -427,26 +427,27 @@ def _persist_minute_flow(symbol, intraday):
     try:
         with psycopg.connect(database_url, connect_timeout=8) as connection:
             _ensure_market_table(connection)
-            connection.executemany(
-                """
-                INSERT INTO market_minute_flows
-                    (symbol, trade_time, source, last_price, vwap, price_change_pct,
-                     inferred_buy_wan, inferred_sell_wan, inferred_net_wan,
-                     cumulative_net_wan, signal)
-                VALUES (%s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (symbol, trade_time, source) DO UPDATE SET
-                    last_price = EXCLUDED.last_price,
-                    vwap = EXCLUDED.vwap,
-                    price_change_pct = EXCLUDED.price_change_pct,
-                    inferred_buy_wan = EXCLUDED.inferred_buy_wan,
-                    inferred_sell_wan = EXCLUDED.inferred_sell_wan,
-                    inferred_net_wan = EXCLUDED.inferred_net_wan,
-                    cumulative_net_wan = EXCLUDED.cumulative_net_wan,
-                    signal = EXCLUDED.signal,
-                    observed_at = NOW()
-                """,
-                rows,
-            )
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO market_minute_flows
+                        (symbol, trade_time, source, last_price, vwap, price_change_pct,
+                         inferred_buy_wan, inferred_sell_wan, inferred_net_wan,
+                         cumulative_net_wan, signal)
+                    VALUES (%s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, trade_time, source) DO UPDATE SET
+                        last_price = EXCLUDED.last_price,
+                        vwap = EXCLUDED.vwap,
+                        price_change_pct = EXCLUDED.price_change_pct,
+                        inferred_buy_wan = EXCLUDED.inferred_buy_wan,
+                        inferred_sell_wan = EXCLUDED.inferred_sell_wan,
+                        inferred_net_wan = EXCLUDED.inferred_net_wan,
+                        cumulative_net_wan = EXCLUDED.cumulative_net_wan,
+                        signal = EXCLUDED.signal,
+                        observed_at = NOW()
+                    """,
+                    rows,
+                )
         return {"status": "saved", "rows": len(rows)}
     except Exception as exc:
         return {"status": "error", "message": str(exc)[:160]}
@@ -1859,4 +1860,5 @@ def get_stock_fund_dashboard(
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok"}
+
 
