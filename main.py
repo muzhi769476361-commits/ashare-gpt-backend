@@ -11,7 +11,7 @@ import requests
 import secrets
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pytdx.hq import TdxHq_API
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://my-akshare-api.onrender.com").rstrip("/")
@@ -35,6 +35,10 @@ CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
 MARKET_SNAPSHOT_TTL_SECONDS = 30
 _market_snapshot_cache = {"expires_at": 0.0, "value": None}
 _market_snapshot_lock = threading.Lock()
+_trading_calendar_cache = {"expires_at": 0.0, "dates": []}
+_trading_calendar_lock = threading.Lock()
+_market_table_lock = threading.Lock()
+_market_table_ready = False
 
 
 def _china_now():
@@ -365,6 +369,87 @@ def _ensure_intel_table(connection):
     )
 
 
+def _ensure_market_table(connection):
+    global _market_table_ready
+    if _market_table_ready:
+        return
+    with _market_table_lock:
+        if _market_table_ready:
+            return
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_minute_flows (
+                symbol TEXT NOT NULL,
+                trade_time TIMESTAMPTZ NOT NULL,
+                source TEXT NOT NULL,
+                last_price DOUBLE PRECISION,
+                vwap DOUBLE PRECISION,
+                price_change_pct DOUBLE PRECISION,
+                inferred_buy_wan DOUBLE PRECISION,
+                inferred_sell_wan DOUBLE PRECISION,
+                inferred_net_wan DOUBLE PRECISION,
+                cumulative_net_wan DOUBLE PRECISION,
+                signal TEXT,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (symbol, trade_time, source)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_market_minute_symbol_time
+            ON market_minute_flows (symbol, trade_time DESC)
+            """
+        )
+        _market_table_ready = True
+
+
+def _persist_minute_flow(symbol, intraday):
+    timeline = intraday.get("timeline") or []
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url or not timeline:
+        return {"status": "skipped", "reason": "DATABASE_URL未配置或没有分钟数据"}
+    rows = []
+    for item in timeline:
+        rows.append((
+            symbol,
+            item.get("bucket"),
+            intraday.get("source", "unknown"),
+            item.get("last_price"),
+            item.get("vwap"),
+            item.get("price_change_pct"),
+            item.get("inferred_buy_wan"),
+            item.get("inferred_sell_wan"),
+            item.get("inferred_net_wan"),
+            item.get("cumulative_inferred_net_wan"),
+            item.get("signal"),
+        ))
+    try:
+        with psycopg.connect(database_url, connect_timeout=8) as connection:
+            _ensure_market_table(connection)
+            connection.executemany(
+                """
+                INSERT INTO market_minute_flows
+                    (symbol, trade_time, source, last_price, vwap, price_change_pct,
+                     inferred_buy_wan, inferred_sell_wan, inferred_net_wan,
+                     cumulative_net_wan, signal)
+                VALUES (%s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol, trade_time, source) DO UPDATE SET
+                    last_price = EXCLUDED.last_price,
+                    vwap = EXCLUDED.vwap,
+                    price_change_pct = EXCLUDED.price_change_pct,
+                    inferred_buy_wan = EXCLUDED.inferred_buy_wan,
+                    inferred_sell_wan = EXCLUDED.inferred_sell_wan,
+                    inferred_net_wan = EXCLUDED.inferred_net_wan,
+                    cumulative_net_wan = EXCLUDED.cumulative_net_wan,
+                    signal = EXCLUDED.signal,
+                    observed_at = NOW()
+                """,
+                rows,
+            )
+        return {"status": "saved", "rows": len(rows)}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)[:160]}
 def _verify_feishu_token(payload):
     expected = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
     if not expected:
@@ -672,6 +757,47 @@ def _hidden_flow_label(net_value, price_change_pct=None):
     return "中性"
 
 
+def _trading_date_context():
+    """返回真实交易日锚点；休市日绝不把历史分时错误标成今天。"""
+    now = _china_now()
+    with _trading_calendar_lock:
+        if time.monotonic() >= _trading_calendar_cache["expires_at"]:
+            try:
+                calendar = ak.tool_trade_date_hist_sina()
+                values = pd.to_datetime(calendar["trade_date"], errors="coerce").dropna()
+                _trading_calendar_cache["dates"] = sorted({value.date() for value in values})
+                _trading_calendar_cache["expires_at"] = time.monotonic() + 21600
+            except Exception:
+                _trading_calendar_cache["expires_at"] = time.monotonic() + 300
+        dates = list(_trading_calendar_cache["dates"])
+    today = now.date()
+    if dates:
+        eligible = [value for value in dates if value <= today]
+        trade_date = max(eligible) if eligible else today
+        scheduled = today in set(dates)
+    else:
+        trade_date = today
+        scheduled = today.weekday() < 5
+    session, live_session = _market_session(now)
+    if not scheduled:
+        session, live_session = "closed_non_trading_day", False
+    return {
+        "trade_date": trade_date.isoformat(),
+        "calendar_source": "新浪交易日历" if dates else "工作日降级判断",
+        "market_status": session,
+        "is_trading_day": scheduled,
+        "is_live_session": live_session and scheduled,
+    }
+
+
+def _signal_details(label, confidence, evidence):
+    return {
+        "label": label,
+        "confidence_score": round(max(0.0, min(1.0, confidence)), 2),
+        "evidence": evidence,
+    }
+
+
 def _intraday_hidden_flow(symbol, recent_trades=1200, bucket_minutes=5):
     """根据公开成交方向、价格与成交额构造分时隐性资金代理。"""
     ticks = _eastmoney_intraday(symbol).tail(recent_trades).copy()
@@ -685,10 +811,11 @@ def _intraday_hidden_flow(symbol, recent_trades=1200, bucket_minutes=5):
     ticks.loc[sell_mask, "signed_amount_wan"] = -ticks.loc[sell_mask, "amount_wan"]
     ticks["neutral_amount_wan"] = ticks["amount_wan"].where(~(buy_mask | sell_mask), 0.0)
 
-    today = _china_now().strftime("%Y-%m-%d")
+    date_context = _trading_date_context()
+    trade_date = date_context["trade_date"]
     raw_times = ticks["time"].astype(str)
     normalized_times = raw_times.map(
-        lambda value: f"{today} {value}" if len(value.strip()) <= 8 and ":" in value else value
+        lambda value: f"{trade_date} {value}" if len(value.strip()) <= 8 and ":" in value else value
     )
     parsed_times = pd.to_datetime(normalized_times, errors="coerce")
     if parsed_times.notna().any():
@@ -727,11 +854,33 @@ def _intraday_hidden_flow(symbol, recent_trades=1200, bucket_minutes=5):
     inferred_buy_wan = float(ticks.loc[buy_mask, "amount_wan"].sum())
     inferred_sell_wan = float(ticks.loc[sell_mask, "amount_wan"].sum())
     inferred_net_wan = inferred_buy_wan - inferred_sell_wan
+    active_total = inferred_buy_wan + inferred_sell_wan
+    imbalance = inferred_net_wan / active_total if active_total else 0.0
+    degraded = bool(ticks.attrs.get("degraded", False))
+    evidence = [
+        f"主动买卖净额代理 {inferred_net_wan:.2f} 万元",
+        f"主动盘失衡率 {imbalance:.2%}",
+        f"样本 {len(ticks)} 条，{bucket_minutes} 分钟聚合",
+    ]
+    if price_change_pct is not None:
+        evidence.append(f"样本价格变化 {price_change_pct:.2f}%")
+    confidence = 0.45 + min(len(ticks) / 2000, 0.25) + min(abs(imbalance), 0.2)
+    if degraded:
+        confidence -= 0.2
+    signal_label = _hidden_flow_label(inferred_net_wan, price_change_pct)
+    latest_bucket = parsed_times.max() if parsed_times.notna().any() else None
+    freshness_seconds = None
+    if latest_bucket is not None:
+        latest_aware = latest_bucket.to_pydatetime().replace(tzinfo=CHINA_TZ)
+        freshness_seconds = max(0, int((_china_now() - latest_aware).total_seconds()))
     return {
         "source": ticks.attrs.get("source", "公开成交方向代理"),
         "data_level": ticks.attrs.get("data_level", "public_trade_prints_inferred_side"),
-        "degraded": bool(ticks.attrs.get("degraded", False)),
+        "degraded": degraded,
         "degraded_reason": ticks.attrs.get("degraded_reason"),
+        **date_context,
+        "freshness_seconds": freshness_seconds,
+        "is_stale": (not date_context["is_live_session"]) or (freshness_seconds is not None and freshness_seconds > 300),
         "sample_count": int(len(ticks)),
         "bucket_minutes": bucket_minutes,
         "price_change_pct": round(price_change_pct, 4) if price_change_pct is not None else None,
@@ -739,7 +888,8 @@ def _intraday_hidden_flow(symbol, recent_trades=1200, bucket_minutes=5):
         "inferred_sell_wan": round(inferred_sell_wan, 2),
         "inferred_net_wan": round(inferred_net_wan, 2),
         "neutral_wan": round(float(ticks["neutral_amount_wan"].sum()), 2),
-        "signal": _hidden_flow_label(inferred_net_wan, price_change_pct),
+        "signal": signal_label,
+        "signal_details": _signal_details(signal_label, confidence, evidence),
         "timeline": timeline[-120:],
     }
 
@@ -822,6 +972,16 @@ def _daily_hidden_flow(symbol, days=30):
     five_day = float(frame["inferred_net_yuan"].tail(5).sum()) / 10000
     twenty_day = float(frame["inferred_net_yuan"].tail(20).sum()) / 10000
     latest_change = float(frame.iloc[-1]["change_pct_calc"])
+    latest_cmf = float(frame.iloc[-1]["cmf_20"])
+    latest_relative_volume = float(frame.iloc[-1]["relative_volume"])
+    signal_label = _hidden_flow_label(five_day, latest_change)
+    evidence = [
+        f"近5日隐性净额代理 {five_day:.2f} 万元",
+        f"CMF(20) {latest_cmf:.4f}",
+        f"最新相对成交量 {latest_relative_volume:.2f} 倍",
+        f"最新日涨跌 {latest_change:.2f}%",
+    ]
+    confidence = 0.45 + min(abs(latest_cmf), 0.25) + min(abs(latest_relative_volume - 1) * 0.15, 0.2)
     return {
         "source": source_name,
         "data_level": "price_volume_hidden_flow_proxy",
@@ -832,7 +992,8 @@ def _daily_hidden_flow(symbol, days=30):
             "last_5_days": round(five_day, 2),
             "last_20_days": round(twenty_day, 2),
         },
-        "signal": _hidden_flow_label(five_day, latest_change),
+        "signal": signal_label,
+        "signal_details": _signal_details(signal_label, confidence, evidence),
         "daily": records,
     }
 
@@ -1144,6 +1305,12 @@ def get_data_capabilities():
                 "modes": ["intraday", "daily", "both"],
                 "level": "inferred_from_public_trade_and_price_volume_data",
                 "not_actual_dark_pool_data": True,
+            },
+            "stock_fund_dashboard": {"available": True, "single_call": True, "partial_results": True},
+            "minute_flow_history": {"available": bool(os.getenv("DATABASE_URL")), "storage": "PostgreSQL"},
+            "licensed_l2_adapter": {
+                "configured": bool(os.getenv("IFIND_REFRESH_TOKEN")),
+                "provider": os.getenv("L2_PROVIDER", "none"),
             },
         },
     }
@@ -1568,6 +1735,7 @@ def get_hidden_fund_flow(
     if mode in {"intraday", "both"}:
         try:
             result["intraday"] = _intraday_hidden_flow(clean_symbol, recent_trades, bucket_minutes)
+            result["storage"] = _persist_minute_flow(clean_symbol, result["intraday"])
         except Exception as exc:
             errors.append({"scope": "intraday", "message": str(exc)[:240]})
     if mode in {"daily", "both"}:
@@ -1582,6 +1750,111 @@ def get_hidden_fund_flow(
         result["status"] = "error"
         result["message"] = "分时与日线隐性资金代理均不可用"
     return result
+
+
+@app.get("/api/minute_flow_history")
+def get_minute_flow_history(
+    symbol: str = Query(..., description="A股6位代码"),
+    start_time: str = Query(None, description="ISO开始时间；默认最近24小时"),
+    end_time: str = Query(None, description="ISO结束时间；默认当前时间"),
+    limit: int = Query(500, ge=1, le=5000),
+):
+    clean_symbol = _clean_a_symbol(symbol)
+    end_value = end_time or _china_now().isoformat()
+    start_value = start_time or (_china_now() - datetime.timedelta(hours=24)).isoformat()
+    try:
+        with psycopg.connect(_database_url(), connect_timeout=8) as connection:
+            _ensure_market_table(connection)
+            rows = connection.execute(
+                """
+                SELECT trade_time, source, last_price, vwap, price_change_pct,
+                       inferred_buy_wan, inferred_sell_wan, inferred_net_wan,
+                       cumulative_net_wan, signal, observed_at
+                FROM market_minute_flows
+                WHERE symbol = %s AND trade_time BETWEEN %s::timestamptz AND %s::timestamptz
+                ORDER BY trade_time DESC
+                LIMIT %s
+                """,
+                (clean_symbol, start_value, end_value, limit),
+            ).fetchall()
+        data = [{
+            "trade_time": row[0].isoformat(), "source": row[1], "last_price": row[2],
+            "vwap": row[3], "price_change_pct": row[4], "inferred_buy_wan": row[5],
+            "inferred_sell_wan": row[6], "inferred_net_wan": row[7],
+            "cumulative_net_wan": row[8], "signal": row[9],
+            "observed_at": row[10].isoformat(),
+        } for row in rows]
+        return {"status": "success", "symbol": clean_symbol, "count": len(data), "data": data}
+    except Exception as exc:
+        return {"status": "error", "message": f"分钟历史读取失败: {str(exc)[:200]}"}
+
+
+def _licensed_l2_status():
+    provider = os.getenv("L2_PROVIDER", "none")
+    configured = bool(os.getenv("IFIND_REFRESH_TOKEN")) if provider == "ifind" else False
+    return {
+        "provider": provider,
+        "configured": configured,
+        "status": "ready_for_authorized_adapter" if configured else "not_configured",
+        "required": ["L2_PROVIDER=ifind", "IFIND_REFRESH_TOKEN（仅保存在服务端Secret）"],
+        "warning": "普通同花顺L2客户端会员不等于iFinD/QuantAPI程序化授权。",
+    }
+
+
+@app.get("/api/l2_provider_status")
+def get_l2_provider_status():
+    return {"status": "success", "as_of": _china_now().isoformat(timespec="seconds"), **_licensed_l2_status()}
+
+
+@app.get("/api/stock_fund_dashboard")
+def get_stock_fund_dashboard(
+    symbol: str = Query(..., description="A股6位代码"),
+    days: int = Query(30, ge=5, le=120),
+    recent_trades: int = Query(1200, ge=20, le=5000),
+    bucket_minutes: int = Query(5, ge=1, le=30),
+):
+    """单次返回盘口、分时资金、日线资金、置信度、存储和L2状态。"""
+    clean_symbol = _clean_a_symbol(symbol)
+    tasks = {
+        "quote": lambda: _tencent_orderbook(clean_symbol),
+        "intraday": lambda: _intraday_hidden_flow(clean_symbol, recent_trades, bucket_minutes),
+        "daily": lambda: _daily_hidden_flow(clean_symbol, days),
+    }
+    executor = ThreadPoolExecutor(max_workers=3)
+    futures = {executor.submit(task): name for name, task in tasks.items()}
+    data, errors = {}, []
+    try:
+        for future in as_completed(futures, timeout=40):
+            name = futures[future]
+            try:
+                data[name] = future.result()
+            except Exception as exc:
+                errors.append({"scope": name, "message": str(exc)[:200]})
+    except FuturesTimeoutError:
+        for future, name in futures.items():
+            if not future.done():
+                errors.append({"scope": name, "message": "upstream timeout after 40 seconds"})
+    executor.shutdown(wait=False, cancel_futures=True)
+    storage = _persist_minute_flow(clean_symbol, data["intraday"]) if "intraday" in data else {"status": "skipped"}
+    signal_details = {
+        scope: data[scope].get("signal_details")
+        for scope in ("intraday", "daily") if scope in data
+    }
+    return {
+        "status": "success" if data else "error",
+        "symbol": clean_symbol,
+        "as_of": _china_now().isoformat(timespec="seconds"),
+        "trade_context": _trading_date_context(),
+        "quote": data.get("quote"),
+        "intraday": data.get("intraday"),
+        "daily": data.get("daily"),
+        "signals": signal_details,
+        "storage": storage,
+        "l2": _licensed_l2_status(),
+        "errors": errors,
+        "degraded": bool(errors),
+        "warning": "资金字段为公开数据推断值；只有配置合规L2接口后才提供授权逐笔委托与十档数据。",
+    }
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
