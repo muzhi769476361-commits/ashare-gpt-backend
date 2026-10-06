@@ -657,6 +657,165 @@ def _eastmoney_intraday(symbol):
         return result
 
 
+def _hidden_flow_label(net_value, price_change_pct=None):
+    """把资金方向代理翻译为可读标签，不把推断值冒充真实账户流水。"""
+    if net_value is None:
+        return "数据不足"
+    if net_value > 0:
+        if price_change_pct is not None and price_change_pct <= 0:
+            return "隐性吸筹代理"
+        return "流入代理"
+    if net_value < 0:
+        if price_change_pct is not None and price_change_pct >= 0:
+            return "隐性派发代理"
+        return "流出代理"
+    return "中性"
+
+
+def _intraday_hidden_flow(symbol, recent_trades=1200, bucket_minutes=5):
+    """根据公开成交方向、价格与成交额构造分时隐性资金代理。"""
+    ticks = _eastmoney_intraday(symbol).tail(recent_trades).copy()
+    if ticks.empty:
+        raise ValueError("暂无分时成交数据")
+
+    buy_mask = ticks["side"].astype(str).str.contains("买", na=False)
+    sell_mask = ticks["side"].astype(str).str.contains("卖", na=False)
+    ticks["signed_amount_wan"] = 0.0
+    ticks.loc[buy_mask, "signed_amount_wan"] = ticks.loc[buy_mask, "amount_wan"]
+    ticks.loc[sell_mask, "signed_amount_wan"] = -ticks.loc[sell_mask, "amount_wan"]
+    ticks["neutral_amount_wan"] = ticks["amount_wan"].where(~(buy_mask | sell_mask), 0.0)
+
+    today = _china_now().strftime("%Y-%m-%d")
+    raw_times = ticks["time"].astype(str)
+    normalized_times = raw_times.map(
+        lambda value: f"{today} {value}" if len(value.strip()) <= 8 and ":" in value else value
+    )
+    parsed_times = pd.to_datetime(normalized_times, errors="coerce")
+    if parsed_times.notna().any():
+        ticks["bucket"] = parsed_times.dt.floor(f"{bucket_minutes}min")
+    else:
+        ticks["bucket"] = pd.RangeIndex(len(ticks)) // max(1, bucket_minutes)
+
+    timeline = []
+    cumulative_net = 0.0
+    for bucket, frame in ticks.groupby("bucket", sort=True):
+        buy_wan = float(frame.loc[frame["signed_amount_wan"] > 0, "signed_amount_wan"].sum())
+        sell_wan = abs(float(frame.loc[frame["signed_amount_wan"] < 0, "signed_amount_wan"].sum()))
+        net_wan = buy_wan - sell_wan
+        cumulative_net += net_wan
+        first_price = float(frame.iloc[0]["price"])
+        last_price = float(frame.iloc[-1]["price"])
+        price_change_pct = (last_price / first_price - 1) * 100 if first_price else None
+        shares = pd.to_numeric(frame["vol"], errors="coerce").fillna(0) * 100
+        vwap = float((frame["price"] * shares).sum() / shares.sum()) if shares.sum() else None
+        bucket_text = bucket.isoformat() if hasattr(bucket, "isoformat") else str(bucket)
+        timeline.append({
+            "bucket": bucket_text,
+            "last_price": round(last_price, 4),
+            "vwap": round(vwap, 4) if vwap is not None else None,
+            "price_change_pct": round(price_change_pct, 4) if price_change_pct is not None else None,
+            "inferred_buy_wan": round(buy_wan, 2),
+            "inferred_sell_wan": round(sell_wan, 2),
+            "inferred_net_wan": round(net_wan, 2),
+            "cumulative_inferred_net_wan": round(cumulative_net, 2),
+            "signal": _hidden_flow_label(net_wan, price_change_pct),
+        })
+
+    first_price = float(ticks.iloc[0]["price"])
+    last_price = float(ticks.iloc[-1]["price"])
+    price_change_pct = (last_price / first_price - 1) * 100 if first_price else None
+    inferred_buy_wan = float(ticks.loc[buy_mask, "amount_wan"].sum())
+    inferred_sell_wan = float(ticks.loc[sell_mask, "amount_wan"].sum())
+    inferred_net_wan = inferred_buy_wan - inferred_sell_wan
+    return {
+        "source": ticks.attrs.get("source", "公开成交方向代理"),
+        "data_level": ticks.attrs.get("data_level", "public_trade_prints_inferred_side"),
+        "degraded": bool(ticks.attrs.get("degraded", False)),
+        "degraded_reason": ticks.attrs.get("degraded_reason"),
+        "sample_count": int(len(ticks)),
+        "bucket_minutes": bucket_minutes,
+        "price_change_pct": round(price_change_pct, 4) if price_change_pct is not None else None,
+        "inferred_buy_wan": round(inferred_buy_wan, 2),
+        "inferred_sell_wan": round(inferred_sell_wan, 2),
+        "inferred_net_wan": round(inferred_net_wan, 2),
+        "neutral_wan": round(float(ticks["neutral_amount_wan"].sum()), 2),
+        "signal": _hidden_flow_label(inferred_net_wan, price_change_pct),
+        "timeline": timeline[-120:],
+    }
+
+
+def _daily_hidden_flow(symbol, days=30):
+    """用日线量价位置、CMF 与 OBV 构造日级隐性资金代理。"""
+    end = _china_now().strftime("%Y%m%d")
+    start = (_china_now() - datetime.timedelta(days=max(days * 3, 90))).strftime("%Y%m%d")
+    frame = ak.stock_zh_a_hist(
+        symbol=symbol,
+        period="daily",
+        start_date=start,
+        end_date=end,
+        adjust="qfq",
+    )
+    if frame is None or frame.empty:
+        raise ValueError("暂无日线数据")
+    frame = frame.tail(days).copy()
+    for column in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["收盘", "最高", "最低", "成交量", "成交额"])
+    if frame.empty:
+        raise ValueError("日线量价字段不完整")
+
+    price_range = (frame["最高"] - frame["最低"]).replace(0, pd.NA)
+    frame["close_location"] = (
+        ((frame["收盘"] - frame["最低"]) - (frame["最高"] - frame["收盘"])) / price_range
+    ).fillna(0.0)
+    frame["inferred_net_yuan"] = frame["close_location"] * frame["成交额"]
+    frame["cmf_20"] = (
+        frame["inferred_net_yuan"].rolling(20, min_periods=3).sum()
+        / frame["成交额"].rolling(20, min_periods=3).sum().replace(0, pd.NA)
+    ).fillna(0.0)
+    frame["change_pct_calc"] = frame["收盘"].pct_change(fill_method=None).fillna(0.0) * 100
+    volume_median = frame["成交量"].rolling(20, min_periods=3).median().replace(0, pd.NA)
+    frame["relative_volume"] = (frame["成交量"] / volume_median).fillna(1.0)
+    frame["obv_delta"] = frame["成交量"] * frame["change_pct_calc"].map(
+        lambda value: 1 if value > 0 else (-1 if value < 0 else 0)
+    )
+
+    records = []
+    for _, row in frame.iterrows():
+        net_wan = float(row["inferred_net_yuan"]) / 10000
+        change_pct = float(row["change_pct_calc"])
+        records.append({
+            "date": str(row["日期"]),
+            "close": round(float(row["收盘"]), 4),
+            "change_pct": round(change_pct, 4),
+            "amount_yi": round(float(row["成交额"]) / 100000000, 4),
+            "close_location": round(float(row["close_location"]), 4),
+            "relative_volume": round(float(row["relative_volume"]), 4),
+            "cmf_20": round(float(row["cmf_20"]), 4),
+            "obv_delta_lots": round(float(row["obv_delta"]), 2),
+            "inferred_net_wan": round(net_wan, 2),
+            "signal": _hidden_flow_label(net_wan, change_pct),
+        })
+
+    one_day = float(frame["inferred_net_yuan"].tail(1).sum()) / 10000
+    five_day = float(frame["inferred_net_yuan"].tail(5).sum()) / 10000
+    twenty_day = float(frame["inferred_net_yuan"].tail(20).sum()) / 10000
+    latest_change = float(frame.iloc[-1]["change_pct_calc"])
+    return {
+        "source": "东方财富前复权日线",
+        "data_level": "price_volume_hidden_flow_proxy",
+        "days": int(len(frame)),
+        "latest_date": str(frame.iloc[-1]["日期"]),
+        "inferred_net_wan": {
+            "latest_day": round(one_day, 2),
+            "last_5_days": round(five_day, 2),
+            "last_20_days": round(twenty_day, 2),
+        },
+        "signal": _hidden_flow_label(five_day, latest_change),
+        "daily": records,
+    }
+
+
 def _tencent_orderbook(symbol):
     """腾讯公开行情的买卖五档；这是 Level-1 五档快照，不冒充交易所 L2。"""
     prefix = "sh" if symbol.startswith(("6", "688", "900")) else "sz"
@@ -959,6 +1118,12 @@ def get_data_capabilities():
             "sector_fund_flow": {"available": True, "scopes": ["行业", "概念", "地域"]},
             "lhb": {"available": True, "freshness": "exchange_post_close_disclosure"},
             "intraday_absorption": {"available": True, "level": "quant_inference_from_public_trades_and_level1_book"},
+            "hidden_fund_flow": {
+                "available": True,
+                "modes": ["intraday", "daily", "both"],
+                "level": "inferred_from_public_trade_and_price_volume_data",
+                "not_actual_dark_pool_data": True,
+            },
         },
     }
 
@@ -1347,6 +1512,55 @@ def get_intraday_absorption(
         }
     except Exception as exc:
         return {"status": "error", "message": f"分时承接计算失败: {str(exc)}"}
+
+
+@app.get("/api/hidden_fund_flow")
+def get_hidden_fund_flow(
+    symbol: str = Query(..., description="A股6位代码，如 600519 或 000001"),
+    mode: str = Query("both", description="intraday、daily 或 both"),
+    days: int = Query(30, ge=5, le=120, description="日线分析交易日数量"),
+    recent_trades: int = Query(1200, ge=20, le=5000, description="分时分析最近成交/分钟记录数"),
+    bucket_minutes: int = Query(5, ge=1, le=30, description="分时资金序列聚合分钟数"),
+):
+    """
+    返回分时和日线“暗盘资金”代理。
+
+    A股公开免费行情无法观察真实暗池、券商账户或机构席位的实时净流入，
+    因此这里使用成交方向、VWAP、收盘位置、CMF、OBV 与量价背离进行可解释推断。
+    """
+    if mode not in {"intraday", "daily", "both"}:
+        raise HTTPException(status_code=422, detail="mode 必须是 intraday、daily 或 both")
+    clean_symbol = _clean_a_symbol(symbol)
+    result = {
+        "status": "success",
+        "symbol": clean_symbol,
+        "as_of": _china_now().isoformat(timespec="seconds"),
+        "mode": mode,
+        "data_level": "inferred_hidden_flow_proxy",
+        "methodology": {
+            "intraday": "公开成交买卖方向（不可用时为分钟涨跌方向代理）+ 成交额 + VWAP",
+            "daily": "日线收盘位置资金量代理 + CMF(20) + OBV方向 + 相对成交量",
+        },
+        "warning": "这是公开量价数据计算的隐性资金代理，不是真实暗池成交、账户级资金流水或确定性主力动向。",
+    }
+    errors = []
+    if mode in {"intraday", "both"}:
+        try:
+            result["intraday"] = _intraday_hidden_flow(clean_symbol, recent_trades, bucket_minutes)
+        except Exception as exc:
+            errors.append({"scope": "intraday", "message": str(exc)[:240]})
+    if mode in {"daily", "both"}:
+        try:
+            result["daily"] = _daily_hidden_flow(clean_symbol, days)
+        except Exception as exc:
+            errors.append({"scope": "daily", "message": str(exc)[:240]})
+    if errors:
+        result["errors"] = errors
+        result["degraded"] = True
+    if "intraday" not in result and "daily" not in result:
+        result["status"] = "error"
+        result["message"] = "分时与日线隐性资金代理均不可用"
+    return result
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health_check():
