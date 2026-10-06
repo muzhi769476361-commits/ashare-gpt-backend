@@ -712,9 +712,9 @@ def _eastmoney_intraday(symbol):
     try:
         return _eastmoney_trade_prints(symbol)
     except Exception as trade_error:
-        now = _china_now()
-        start = now.strftime("%Y-%m-%d 09:15:00")
-        end = now.strftime("%Y-%m-%d %H:%M:%S")
+        trade_date = _trading_date_context()["trade_date"]
+        start = f"{trade_date} 09:15:00"
+        end = f"{trade_date} 15:05:00"
         minute_df = ak.stock_zh_a_hist_min_em(
             symbol=symbol,
             start_date=start,
