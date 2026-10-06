@@ -715,15 +715,50 @@ def _eastmoney_intraday(symbol):
         trade_date = _trading_date_context()["trade_date"]
         start = f"{trade_date} 09:15:00"
         end = f"{trade_date} 15:05:00"
-        minute_df = ak.stock_zh_a_hist_min_em(
-            symbol=symbol,
-            start_date=start,
-            end_date=end,
-            period="1",
-            adjust="",
-        )
+        minute_error = None
+        try:
+            minute_df = ak.stock_zh_a_hist_min_em(
+                symbol=symbol,
+                start_date=start,
+                end_date=end,
+                period="1",
+                adjust="",
+            )
+        except Exception as exc:
+            minute_df, minute_error = None, exc
         if minute_df is None or minute_df.empty:
-            raise ValueError(f"逐笔与分钟数据均不可用；逐笔错误: {str(trade_error)[:120]}")
+            full_symbol = f"sh{symbol}" if symbol.startswith(("6", "688")) else f"sz{symbol}"
+            sina_df = ak.stock_zh_a_minute(symbol=full_symbol, period="1", adjust="")
+            if sina_df is None or sina_df.empty:
+                raise ValueError(
+                    f"逐笔与分钟数据均不可用；逐笔错误: {str(trade_error)[:100]}；"
+                    f"东方财富分钟错误: {str(minute_error)[:100]}"
+                )
+            time_col = next((name for name in ("day", "时间", "日期") if name in sina_df.columns), None)
+            close_col = next((name for name in ("close", "收盘") if name in sina_df.columns), None)
+            volume_col = next((name for name in ("volume", "成交量") if name in sina_df.columns), None)
+            if not all((time_col, close_col, volume_col)):
+                raise ValueError("新浪分钟数据字段不完整")
+            parsed = pd.to_datetime(sina_df[time_col], errors="coerce")
+            matching = sina_df.loc[parsed.dt.strftime("%Y-%m-%d") == trade_date].copy()
+            if matching.empty:
+                latest_date = parsed.dropna().max().date()
+                matching = sina_df.loc[parsed.dt.date == latest_date].copy()
+            close = pd.to_numeric(matching[close_col], errors="coerce")
+            volume = pd.to_numeric(matching[volume_col], errors="coerce")
+            delta = close.diff().fillna(0)
+            result = pd.DataFrame({
+                "time": matching[time_col].astype(str),
+                "price": close,
+                "vol": volume,
+                "side": delta.map(lambda value: "买盘代理" if value > 0 else ("卖盘代理" if value < 0 else "中性代理")),
+                "amount_wan": (close * volume / 10000).round(2),
+            }).dropna(subset=["price", "vol", "amount_wan"])
+            result.attrs["data_level"] = "one_minute_bar_direction_proxy"
+            result.attrs["source"] = "新浪一分钟行情代理"
+            result.attrs["degraded"] = True
+            result.attrs["degraded_reason"] = f"逐笔及东方财富分钟不可用: {str(trade_error)[:100]}"
+            return result
         close = pd.to_numeric(minute_df["收盘"], errors="coerce")
         volume = pd.to_numeric(minute_df["成交量"], errors="coerce")
         amount = pd.to_numeric(minute_df["成交额"], errors="coerce")
