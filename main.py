@@ -748,13 +748,34 @@ def _daily_hidden_flow(symbol, days=30):
     """用日线量价位置、CMF 与 OBV 构造日级隐性资金代理。"""
     end = _china_now().strftime("%Y%m%d")
     start = (_china_now() - datetime.timedelta(days=max(days * 3, 90))).strftime("%Y%m%d")
-    frame = ak.stock_zh_a_hist(
-        symbol=symbol,
-        period="daily",
-        start_date=start,
-        end_date=end,
-        adjust="qfq",
-    )
+    source_name = "东方财富前复权日线"
+    try:
+        frame = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust="qfq",
+        )
+    except Exception as eastmoney_error:
+        prefix = "sh" if symbol.startswith(("6", "9")) else "sz"
+        try:
+            frame = ak.stock_zh_a_daily(
+                symbol=f"{prefix}{symbol}",
+                start_date=start,
+                end_date=end,
+                adjust="qfq",
+            )
+            frame = frame.rename(columns={
+                "date": "日期", "open": "开盘", "close": "收盘",
+                "high": "最高", "low": "最低", "volume": "成交量", "amount": "成交额",
+            })
+            source_name = "新浪前复权日线（东方财富降级）"
+        except Exception as sina_error:
+            raise ValueError(
+                f"东方财富日线不可用: {str(eastmoney_error)[:100]}；"
+                f"新浪日线不可用: {str(sina_error)[:100]}"
+            ) from sina_error
     if frame is None or frame.empty:
         raise ValueError("暂无日线数据")
     frame = frame.tail(days).copy()
@@ -802,7 +823,7 @@ def _daily_hidden_flow(symbol, days=30):
     twenty_day = float(frame["inferred_net_yuan"].tail(20).sum()) / 10000
     latest_change = float(frame.iloc[-1]["change_pct_calc"])
     return {
-        "source": "东方财富前复权日线",
+        "source": source_name,
         "data_level": "price_volume_hidden_flow_proxy",
         "days": int(len(frame)),
         "latest_date": str(frame.iloc[-1]["日期"]),
